@@ -1,4 +1,9 @@
-streamlit
-pandas
-folium
-streamlit-folium
+streamlit==1.67.0
+pandas==3.1.1
+folium==1.0.0
+streamlit-folium==0.27.4
+requests==2.34.2
+openpyxl==3.1.5
+xlrd==2.0.2
+branca==0.8.2
+urllib3==2.8.0
