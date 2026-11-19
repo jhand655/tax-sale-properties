@@ -1021,6 +1021,13 @@ def popup_html(props: dict[str, Any]) -> str:
         "Investor UI v6.2.1-dev"
         "</div>"
         + tax_sale_html
+        + (
+            "<button type='button' class='lien-review' style='padding:8px 14px;cursor:pointer' "
+            f"data-parcel='{esc(props.get('TaxMapNumber'))}' "
+            f"data-owner='{esc(props.get('SaleOwnerName'))}' "
+            f"data-county-owner='{esc(props.get('OwnerName'))}' "
+            f"data-address='{esc(props.get('SalePropertyAddress'))}'>Lien Review</button>"
+        )
         + property_summary
         + county_values_html
         + (
@@ -1109,6 +1116,80 @@ def filter_geojson(
         features.append(feature)
 
     return {"type": "FeatureCollection", "features": features}
+
+
+class LienReview(MacroElement):
+    """One research form shared by both popup types and all parcel geometries."""
+
+    _template = Template("""
+    {% macro script(this, kwargs) %}
+    {{ this._parent.get_name() }}.on("popupopen", function(event) {
+        const button = event.popup.getElement().querySelector("button.lien-review");
+        if (!button) return;
+        button.onclick = function() {
+            const parcel = button.dataset.parcel;
+            const key = "spartanburg:lien-review:v1:" + parcel;
+            const dialog = document.createElement("dialog");
+            dialog.style.cssText = "width:min(440px,88vw);max-height:84vh;overflow:auto;padding:18px;border:1px solid #ccd5da;border-radius:8px;color:#182633";
+            dialog.setAttribute("aria-label", "Parcel lien review");
+            dialog.innerHTML = `
+              <form>
+                <h2>Lien Review</h2><p class="identity" style="white-space:pre-line"></p>
+                <p>Search by owner name and compare the legal description and releases with this parcel.</p>
+                <fieldset><legend>Records checked</legend>
+                  <label><input type="checkbox" name="deeds"> Mortgages, liens and releases</label>
+                  <a href="https://search.spartanburgdeeds.com/" target="_blank" rel="noopener noreferrer">Deed records</a><br>
+                  <label><input type="checkbox" name="court"> Judgments</label>
+                  <a href="https://www.spartanburgcounty.gov/706/Judgement-Statements" target="_blank" rel="noopener noreferrer">County court index guidance</a><br>
+                  <label><input type="checkbox" name="tax"> State tax liens</label>
+                  <a href="https://dor.sc.gov/LienRegistry" target="_blank" rel="noopener noreferrer">State registry</a>
+                </fieldset>
+                <p><label>Previous owner <input name="previous" type="text"></label></p>
+                <p><label>Deed book / page <input name="deedRef" type="text"></label></p>
+                <label>Your risk assessment <select name="risk"><option>Unreviewed</option><option>Low</option><option>Review</option><option>High Risk</option></select></label>
+                <p><label>Findings and document references<textarea name="notes" rows="3" style="width:100%"></textarea></label></p>
+                <p>Manual research only. Save keeps this review in this browser.</p>
+                <button type="submit">Save review</button> <button type="button" class="close">Close</button>
+                <output aria-live="polite"></output>
+              </form>`;
+            document.body.append(dialog);
+            dialog.querySelector(".identity").textContent = [
+                "Tax map: " + parcel, "Sale owner: " + button.dataset.owner,
+                "County owner: " + button.dataset.countyOwner, "Address: " + button.dataset.address
+            ].join(String.fromCharCode(10));
+            const form = dialog.querySelector("form");
+            const fields = Array.from(form.elements).filter(field => field.name);
+            const status = form.querySelector("output");
+            try {
+                const saved = JSON.parse(localStorage.getItem(key)) || {};
+                for (const field of fields) {
+                    if (field.type === "checkbox") field.checked = saved[field.name] === true;
+                    else if (typeof saved[field.name] === "string") field.value = saved[field.name];
+                }
+            } catch { status.textContent = "Browser could not load the saved review."; }
+            form.oninput = () => { status.textContent = "Unsaved changes"; };
+            form.onsubmit = function(e) {
+                e.preventDefault();
+                const record = {};
+                for (const field of fields)
+                    record[field.name] = field.type === "checkbox" ? field.checked : field.value;
+                try {
+                    localStorage.setItem(key, JSON.stringify(record));
+                    status.textContent = "Saved in this browser.";
+                    button.textContent = "Lien Review · " + record.risk;
+                } catch { status.textContent = "Save failed. Copy your notes before closing."; }
+            };
+            form.querySelector(".close").onclick = () => dialog.close();
+            dialog.onclose = () => { dialog.remove(); button.focus(); };
+            dialog.showModal();
+        };
+        try {
+            const record = JSON.parse(localStorage.getItem("spartanburg:lien-review:v1:" + button.dataset.parcel));
+            button.textContent = record && record.risk ? "Lien Review · " + record.risk : "Lien Review";
+        } catch { button.textContent = "Lien Review"; }
+    });
+    {% endmacro %}
+    """)
 
 
 class MapLegend(MacroElement):
@@ -1234,6 +1315,7 @@ def build_map(geojson: dict[str, Any]) -> folium.Map:
     if bounds:
         map_object.fit_bounds(bounds, padding=(18, 18))
     map_object.add_child(MapLegend())
+    map_object.add_child(LienReview())
     folium.LayerControl(collapsed=False).add_to(map_object)
     return map_object
 
