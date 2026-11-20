@@ -4,6 +4,7 @@ import html
 import json
 import math
 import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -36,6 +37,44 @@ REQUIRED_COLUMNS = {
 }
 MAX_RETURN_BID_COLUMN = "Max Return Bid"
 LEGACY_MAX_BID_COLUMN = "Max Bid"
+LIEN_REVIEW_FILE = Path(__file__).with_name("lien_reviews.json")
+ROD_SEARCH_URL = "https://search.spartanburgdeeds.com/"
+SCDOR_LIEN_URL = "https://dor.sc.gov/LienRegistry"
+SC_COURTS_URL = "https://www.spartanburgcounty.gov/706/Judgement-Statements"
+LIEN_REVIEW_STAGES = [
+    "Not Reviewed",
+    "Preliminary Review In Progress",
+    "Preliminary Review Complete",
+    "Needs Human Review",
+    "Potential Lien / Judgment",
+    "Attorney / Title Search Verified",
+]
+LIEN_RISK_LEVELS = [
+    "Not Assessed",
+    "No Obvious Issue Identified",
+    "Review Required",
+    "Potential Lien / Judgment",
+    "High Risk",
+]
+LIEN_CHECK_RESULTS = [
+    "Not Checked",
+    "None Identified",
+    "Possible Match",
+    "Record Found",
+    "Released / Satisfied",
+    "Not Applicable",
+    "Source Unavailable",
+]
+LIEN_CHECK_FIELDS = [
+    ("mortgage", "Mortgage / Deed of Trust"),
+    ("mortgage_release", "Mortgage Satisfaction / Release"),
+    ("federal_tax_lien", "Federal Tax Lien"),
+    ("mechanics_lien", "Mechanic's Lien"),
+    ("state_tax_lien", "SC State Tax Lien"),
+    ("judgment", "Judgment"),
+    ("foreclosure", "Foreclosure / Lis Pendens"),
+    ("other_encumbrance", "Other Recorded Encumbrance"),
+]
 OUT_FIELDS = [
     "MAPNUMBER",
     "OwnerName",
@@ -44,6 +83,13 @@ OUT_FIELDS = [
     "City",
     "State",
     "Zip",
+    "DeedBook",
+    "DeedPage",
+    "InstrumentNumber",
+    "SaleDate",
+    "PreviousOwnerName",
+    "LegalDescription",
+
     "Acreage",
     "LandUse",
     "YearBuilt",
@@ -900,7 +946,89 @@ def bid_bubble_html(
     """
 
 
-def popup_html(props: dict[str, Any]) -> str:
+def format_arcgis_date(value: Any) -> str:
+    number = numeric_value(value)
+    if number is None:
+        return "—"
+    try:
+        return datetime.fromtimestamp(number / 1000, tz=timezone.utc).strftime("%m/%d/%Y")
+    except (ValueError, OSError, OverflowError):
+        return "—"
+
+
+def load_lien_reviews() -> dict[str, dict[str, Any]]:
+    if not LIEN_REVIEW_FILE.exists():
+        return {}
+    raw = json.loads(LIEN_REVIEW_FILE.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid lien review file")
+    return raw
+
+
+@st.cache_resource
+def review_write_lock():
+    return threading.Lock()
+
+
+def save_lien_review(parcel, review):
+    with review_write_lock():
+        records = load_lien_reviews()
+        records[parcel] = review
+        temp = LIEN_REVIEW_FILE.with_suffix(".tmp")
+        temp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        temp.replace(LIEN_REVIEW_FILE)
+
+
+def default_lien_review(tax_map: str) -> dict[str, Any]:
+    return {
+        "tax_map": tax_map,
+        "stage": "Not Reviewed",
+        "risk": "Not Assessed",
+        "checks": {key: "Not Checked" for key, _ in LIEN_CHECK_FIELDS},
+        "notes": "",
+        "updated_at": "",
+    }
+
+
+def get_lien_review(
+    reviews: dict[str, dict[str, Any]],
+    tax_map: str,
+) -> dict[str, Any]:
+    base = default_lien_review(tax_map)
+    saved = reviews.get(tax_map, {})
+    if not isinstance(saved, dict):
+        return base
+    base.update({k: v for k, v in saved.items() if k != "checks"})
+    saved_checks = saved.get("checks", {})
+    if isinstance(saved_checks, dict):
+        base["checks"].update(saved_checks)
+    return base
+
+
+def lien_review_badge(review: dict[str, Any]) -> tuple[str, str]:
+    risk = str(review.get("risk") or "Not Assessed")
+    if risk == "No Obvious Issue Identified":
+        return risk, "#167a5b"
+    if risk in {"Potential Lien / Judgment", "High Risk"}:
+        return risk, "#a94c44"
+    if risk == "Review Required":
+        return risk, "#b98532"
+    return str(review.get("stage") or "Not Reviewed"), "#6f8190"
+
+
+def find_feature_by_tax_map(
+    geojson: dict[str, Any],
+    tax_map: str,
+) -> dict[str, Any] | None:
+    normalized = normalize_tax_map(tax_map)
+    for feature in geojson.get("features", []):
+        props = feature.get("properties") or {}
+        if normalize_tax_map(props.get("TaxMapNumber", "")) == normalized:
+            return feature
+    return None
+
+
+def popup_html(props: dict[str, Any], review=None) -> str:
     """Build one shared popup used by BOTH the parcel polygon and the bid bubble."""
 
     def esc(value: Any) -> str:
@@ -991,6 +1119,26 @@ def popup_html(props: dict[str, Any]) -> str:
         + row("Land Use", props.get("LandUse") or "—")
     )
 
+    active_review = review or default_lien_review(str(props.get("TaxMapNumber", "")))
+    review_label, review_color = lien_review_badge(active_review)
+    lien_review_html = (
+        section_header("LIEN / TITLE REVIEW")
+        + (
+            "<div style='display:flex;justify-content:space-between;align-items:center;"
+            "gap:10px;padding:3px 0 7px'>"
+            "<span style='color:#555'>Status</span>"
+            f"<span style='background:{review_color};color:white;border-radius:999px;"
+            "padding:4px 8px;font-weight:700;font-size:11px'>"
+            f"{html.escape(review_label)}</span></div>"
+        )
+        + (
+            f"<button type='button' class='open-title-review' data-parcel='{esc(props.get('TaxMapNumber'))}' "
+            "style='display:block;text-align:center;text-decoration:none;"
+            "background:#167a5b;color:white;font-weight:700;border-radius:8px;"
+            "padding:8px 10px;margin-top:4px'>Open Lien Review</button>"
+        )
+    )
+
     county_values_html = (
         section_header("COUNTY VALUES")
         + row(
@@ -1018,15 +1166,16 @@ def popup_html(props: dict[str, Any]) -> str:
         "<div style='font-family:Arial,sans-serif;font-size:12px;"
         "min-width:380px;max-width:430px;color:#111'>"
         "<div style='font-size:10px;color:#777;text-align:right;margin-bottom:2px'>"
-        "Investor UI v6.2.1-dev"
+        "Investor UI v6.3-dev"
         "</div>"
         + tax_sale_html
+        + lien_review_html
         + (
             "<button type='button' class='lien-review' style='padding:8px 14px;cursor:pointer' "
             f"data-parcel='{esc(props.get('TaxMapNumber'))}' "
             f"data-owner='{esc(props.get('SaleOwnerName'))}' "
             f"data-county-owner='{esc(props.get('OwnerName'))}' "
-            f"data-address='{esc(props.get('SalePropertyAddress'))}'>Lien Review</button>"
+            f"data-address='{esc(props.get('SalePropertyAddress'))}'>Browser-local review</button>"
         )
         + property_summary
         + county_values_html
@@ -1124,6 +1273,11 @@ class LienReview(MacroElement):
     _template = Template("""
     {% macro script(this, kwargs) %}
     {{ this._parent.get_name() }}.on("popupopen", function(event) {
+        const open = event.popup.getElement().querySelector(".open-title-review");
+        if (open) open.onclick = () => window.parent.postMessage({
+            isStreamlitMessage: true, type: "streamlit:setComponentValue",
+            dataType: "json", value: {reviewParcel: open.dataset.parcel}
+        }, "*");
         const button = event.popup.getElement().querySelector("button.lien-review");
         if (!button) return;
         button.onclick = function() {
@@ -1176,7 +1330,7 @@ class LienReview(MacroElement):
                 try {
                     localStorage.setItem(key, JSON.stringify(record));
                     status.textContent = "Saved in this browser.";
-                    button.textContent = "Lien Review · " + record.risk;
+                    button.textContent = "Browser-local review · " + record.risk;
                 } catch { status.textContent = "Save failed. Copy your notes before closing."; }
             };
             form.querySelector(".close").onclick = () => dialog.close();
@@ -1185,8 +1339,8 @@ class LienReview(MacroElement):
         };
         try {
             const record = JSON.parse(localStorage.getItem("spartanburg:lien-review:v1:" + button.dataset.parcel));
-            button.textContent = record && record.risk ? "Lien Review · " + record.risk : "Lien Review";
-        } catch { button.textContent = "Lien Review"; }
+            button.textContent = record && record.risk ? "Browser-local review · " + record.risk : "Browser-local review";
+        } catch { button.textContent = "Browser-local review"; }
     });
     {% endmacro %}
     """)
@@ -1218,7 +1372,7 @@ class MapLegend(MacroElement):
         )
 
 
-def build_map(geojson: dict[str, Any]) -> folium.Map:
+def build_map(geojson: dict[str, Any], reviews=None) -> folium.Map:
     map_object = folium.Map(
         location=[34.95, -81.93],
         zoom_start=10,
@@ -1270,7 +1424,7 @@ def build_map(geojson: dict[str, Any]) -> folium.Map:
         map_features.append({"type": "Feature", "geometry": feature["geometry"],
                              "properties": {"color": props.get("BidColor", "#457B9D"),
                                             "label": html.escape(str(props.get("TaxMapNumber", ""))) + " · " + format_currency(props.get("BidAmount")),
-                                            "details": popup_html(props)}})
+                                            "details": popup_html(props, (reviews or {}).get(str(props.get("TaxMapNumber", ""))))}})
     if map_features:
         folium.GeoJson(
             {"type": "FeatureCollection", "features": map_features},
@@ -1303,7 +1457,7 @@ def build_map(geojson: dict[str, Any]) -> folium.Map:
                     f"Bid {format_currency(props.get('BidAmount'))} · "
                     f"Max Return {format_currency(props.get('MaxReturnBid'))}"
                 ),
-                popup=folium.Popup(popup_html(props), max_width=460),
+                popup=folium.Popup(popup_html(props, (reviews or {}).get(str(props.get("TaxMapNumber", "")))), max_width=460),
                 interactive=True,
                 keyboard=True,
                 bubblingMouseEvents=False,
@@ -1318,6 +1472,204 @@ def build_map(geojson: dict[str, Any]) -> folium.Map:
     map_object.add_child(LienReview())
     folium.LayerControl(collapsed=False).add_to(map_object)
     return map_object
+
+
+def render_lien_review_workspace(
+    tax_map: str,
+    merged_geojson: dict[str, Any],
+    reviews: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    feature = find_feature_by_tax_map(merged_geojson, tax_map)
+    if feature is None:
+        st.error(f"Parcel {tax_map} was not found in the currently loaded sale list.")
+        if st.button("Close Lien Review"):
+            st.session_state.pop("review_selection", None)
+            st.query_params.pop("lien_review", None)
+            st.rerun()
+        return reviews
+
+    props = feature.get("properties") or {}
+    tax_map = str(props.get("TaxMapNumber", tax_map))
+    review = get_lien_review(reviews, tax_map)
+    review_label, review_color = lien_review_badge(review)
+
+    st.markdown(
+        f"""
+        <div style="background:#ffffff;border:1px solid #dce3e8;border-left:5px solid {review_color};
+                    border-radius:14px;padding:16px 18px;margin:12px 0 16px;
+                    box-shadow:0 6px 20px rgba(18,32,45,.06)">
+          <div style="font-size:.73rem;font-weight:800;letter-spacing:.09em;
+                      text-transform:uppercase;color:#687582">Preliminary Title Screening</div>
+          <div style="font-size:1.35rem;font-weight:850;color:#12202d;margin-top:3px">
+            Lien Review · {html.escape(tax_map)}
+          </div>
+          <div style="font-size:.9rem;color:#687582;margin-top:4px">
+            {html.escape(str(props.get("SalePropertyAddress") or props.get("PropertyLocation") or "Address unavailable"))}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    top1, top2, top3, top4 = st.columns([1.25, 1.25, 1, 0.8])
+    top1.metric("Current Bid", format_currency(props.get("BidAmount")))
+    top2.metric("Max Return Bid", format_currency(props.get("MaxReturnBid")))
+    top3.metric("Review Status", review.get("stage", "Not Reviewed"))
+    with top4:
+        st.write("")
+        st.write("")
+        if st.button("Close Review", use_container_width=True):
+            st.session_state.pop("review_selection", None)
+            st.query_params.pop("lien_review", None)
+            st.rerun()
+
+    st.markdown("#### Automatic parcel/title identifiers")
+    id1, id2, id3 = st.columns(3)
+    with id1:
+        st.markdown("**Current owner**")
+        st.code(str(props.get("OwnerName") or props.get("SaleOwnerName") or "—"))
+        st.markdown("**Previous owner**")
+        st.code(str(props.get("PreviousOwnerName") or "—"))
+    with id2:
+        st.markdown("**Deed book / page**")
+        deed_book = str(props.get("DeedBook") or "—")
+        deed_page = str(props.get("DeedPage") or "—")
+        st.code(f"{deed_book} / {deed_page}")
+        st.markdown("**Instrument number**")
+        st.code(str(props.get("InstrumentNumber") or "—"))
+    with id3:
+        st.markdown("**County sale date**")
+        st.code(format_arcgis_date(props.get("SaleDate")))
+        st.markdown("**Tax map number**")
+        st.code(tax_map)
+
+    legal_description = str(props.get("LegalDescription") or "").strip()
+    if legal_description:
+        with st.expander("Legal description"):
+            st.write(legal_description)
+
+    st.caption("Saved workspace reviews are shared on this app instance. Hosting restarts or redeploys can erase local files.")
+    st.markdown("#### Official research sources")
+    st.caption(
+        "These buttons open the official public record systems. Phase 1 stores your findings; "
+        "the next development phase will automate sources that expose a reliable search endpoint."
+    )
+    src1, src2, src3 = st.columns(3)
+    with src1:
+        st.link_button(
+            "Register of Deeds",
+            ROD_SEARCH_URL,
+            use_container_width=True,
+            help="Search mortgages, releases, federal tax liens, mechanic's liens, and other recorded documents.",
+        )
+        st.caption("Search current and previous owner names; verify deed book/page and instrument references.")
+    with src2:
+        st.link_button(
+            "SC State Tax Lien Registry",
+            SCDOR_LIEN_URL,
+            use_container_width=True,
+        )
+        st.caption("Search the owner or business name for South Carolina state tax liens.")
+    with src3:
+        st.link_button(
+            "SC Courts Public Index",
+            SC_COURTS_URL,
+            use_container_width=True,
+        )
+        st.caption("Select Spartanburg County; search judgments, foreclosures, lis pendens, owner name, or tax map.")
+
+    st.info(
+        "This workspace is a preliminary screening tool. A saved green status means only that "
+        "no obvious issue was identified in the sources reviewed; it is not a certification of clear title."
+    )
+
+    stage_index = (
+        LIEN_REVIEW_STAGES.index(review.get("stage"))
+        if review.get("stage") in LIEN_REVIEW_STAGES
+        else 0
+    )
+    risk_index = (
+        LIEN_RISK_LEVELS.index(review.get("risk"))
+        if review.get("risk") in LIEN_RISK_LEVELS
+        else 0
+    )
+
+    with st.form(f"lien_review_form_{tax_map}", clear_on_submit=False):
+        st.markdown("#### Review findings")
+        status_col, risk_col = st.columns(2)
+        with status_col:
+            stage = st.selectbox(
+                "Review stage",
+                LIEN_REVIEW_STAGES,
+                index=stage_index,
+            )
+        with risk_col:
+            risk = st.selectbox(
+                "Overall risk",
+                LIEN_RISK_LEVELS,
+                index=risk_index,
+            )
+
+        check_values: dict[str, str] = {}
+        left_col, right_col = st.columns(2)
+        for idx, (key, label) in enumerate(LIEN_CHECK_FIELDS):
+            saved_value = review.get("checks", {}).get(key, "Not Checked")
+            result_index = (
+                LIEN_CHECK_RESULTS.index(saved_value)
+                if saved_value in LIEN_CHECK_RESULTS
+                else 0
+            )
+            target_col = left_col if idx % 2 == 0 else right_col
+            with target_col:
+                check_values[key] = st.selectbox(
+                    label,
+                    LIEN_CHECK_RESULTS,
+                    index=result_index,
+                    key=f"lien_check_{tax_map}_{key}",
+                )
+
+        notes = st.text_area(
+            "Review notes",
+            value=str(review.get("notes") or ""),
+            height=130,
+            placeholder=(
+                "Record instrument numbers, creditor names, amounts, release references, "
+                "possible name matches, attorney/title-search notes, etc."
+            ),
+        )
+
+        save_clicked = st.form_submit_button(
+            "Save Lien Review",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if save_clicked:
+        reviews[tax_map] = {
+            "tax_map": tax_map,
+            "stage": stage,
+            "risk": risk,
+            "checks": check_values,
+            "notes": notes.strip(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            save_lien_review(tax_map, reviews[tax_map])
+        except (OSError, ValueError) as exc:
+            st.error(f"Could not save this review: {exc}")
+            return reviews
+        st.success("Lien review saved.")
+        st.rerun()
+
+    updated_at = str(review.get("updated_at") or "")
+    if updated_at:
+        try:
+            dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+            st.caption(f"Last saved: {dt.astimezone().strftime('%m/%d/%Y %I:%M %p')}")
+        except ValueError:
+            pass
+
+    return reviews
 
 
 def main() -> None:
@@ -1394,6 +1746,11 @@ def main() -> None:
             st.caption(f"Parcel service: {PARCEL_LAYER_URL}")
             st.stop()
 
+    try:
+        lien_reviews = load_lien_reviews()
+    except (ValueError, OSError) as exc:
+        st.warning(f"Saved lien reviews could not be loaded: {exc}")
+        lien_reviews = {}
     matched_count = parcel_count(merged_geojson)
     st.caption(f"County data fetched (UTC): {parcel_geojson.get('fetched_at', 'unavailable')}. Cached for up to 24 hours.")
     bid_min = float(tax_df["Bid Amount"].min())
@@ -1415,7 +1772,7 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Acquisition Filters")
-        st.caption("Investor UI development · v6.2.1")
+        st.caption("Investor UI development · v6.3")
         search_text = st.text_input(
             "Search",
             placeholder="Owner, address, item, parcel…",
@@ -1661,13 +2018,26 @@ def main() -> None:
                 tone="gold",
             )
 
+    review_ids = sorted({str(f["properties"]["TaxMapNumber"]) for f in merged_geojson["features"]})
+    selection = st.selectbox("Open lien review by tax map number", review_ids, index=None, key="review_selection")
+    selected_review = selection or st.query_params.get("lien_review")
+    if selected_review:
+        render_lien_review_workspace(selected_review, merged_geojson, lien_reviews)
+
     render_section_header(
         "Opportunity Map",
         "Scan deals visually, then click any parcel or bid bubble for acquisition and property details.",
     )
     if visible_count:
-        map_object = build_map(filtered_geojson)
-        st_folium(map_object, height=720, use_container_width=True, returned_objects=[])
+        map_object = build_map(filtered_geojson, lien_reviews)
+
+        def open_map_review():
+            selected = (st.session_state.get("opportunity_map") or {}).get("reviewParcel")
+            if selected in review_ids:
+                st.session_state["review_selection"] = selected
+
+        st_folium(map_object, height=720, use_container_width=True, returned_objects=[],
+                  key="opportunity_map", on_change=open_map_review)
     else:
         st.warning("No parcels match the current filters.")
 
@@ -1729,6 +2099,7 @@ def main() -> None:
                     "Owner Name": props.get("SaleOwnerName"),
                     "Property Address": props.get("SalePropertyAddress"),
                     "Property Class": props.get("PropertyClass"),
+                    "Lien Review": get_lien_review(lien_reviews, str(props.get("TaxMapNumber", "")))["stage"],
                     "Bid Amount": props.get("BidAmount"),
                     "Max Return Bid": props.get("MaxReturnBid"),
                     "Bedrooms": props.get("BedRooms"),
