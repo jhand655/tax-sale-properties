@@ -154,34 +154,11 @@ def configure_page() -> None:
           }
 
           [data-testid="stSidebar"] {
-            background: #101c27;
-            border-right: 1px solid #243747;
+            border-inline-end: 1px solid rgba(104,117,130,0.25);
           }
-
-          [data-testid="stSidebar"] * {
-            color: #eef4f7;
-          }
-
-          [data-testid="stSidebar"] .stCaption,
-          [data-testid="stSidebar"] small,
-          [data-testid="stSidebar"] p {
-            color: #b9c7d1 !important;
-          }
-
-          [data-testid="stSidebar"] hr {
-            border-color: #2b4152;
-          }
-
-          [data-testid="stSidebar"] input,
-          [data-testid="stSidebar"] [data-baseweb="select"] > div {
-            background: #172938;
-            border-color: #365064;
-            color: #f7fbfd;
-          }
-
-          [data-testid="stSidebar"] .stSlider,
-          [data-testid="stSidebar"] [data-testid="stFileUploader"] {
-            color: #f7fbfd;
+          [data-testid="stSidebar"] .st-key-filter_count {
+            border-inline-start: 3px solid #269577;
+            padding-inline-start: .7rem;
           }
 
           .investor-hero {
@@ -1824,43 +1801,25 @@ def render_comps(feature):
         st.caption("A value estimate needs subject living area and at least three included comps with price and area.")
 
 
+def reset_property_filters():
+    for key in list(st.session_state):
+        if key.startswith(("filter_", "bid_range_")):
+            del st.session_state[key]
+
+
 def main() -> None:
     configure_page()
     render_hero()
 
     with st.sidebar:
-        st.markdown(
-            """
-            <div style="padding:8px 0 8px 0">
-              <div style="font-size:0.72rem;color:#7fc8ae;font-weight:800;letter-spacing:.11em;text-transform:uppercase">
-                Investor Workspace
-              </div>
-              <div style="font-size:1.28rem;font-weight:850;color:#ffffff;margin-top:3px">
-                Deal Filters
-              </div>
-              <div style="font-size:0.88rem;color:#b9c7d1;margin-top:5px;line-height:1.45">
-                Load a sale list and narrow opportunities by price, property characteristics, and county data.
-              </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        st.header("Sale List")
-        uploaded = st.file_uploader(
-            "Use another tax-sale list",
-            help=(
-                "The file picker shows all files. The app can directly load "
-                "CSV and Excel files: .csv, .xlsx, .xlsm, and .xls. "
-                "Leave blank to use the included 2024 cleaned list."
-            ),
-        )
-        st.caption(
-            "Supported uploads: CSV and Excel. Use the optional column heading "
-            "'Max Return Bid' to override the calculated bid threshold. Older files "
-            "using 'Max Bid' remain compatible. PDF lists must be converted to "
-            "a spreadsheet before loading."
-        )
+        st.subheader("Property filters")
+        count_slot = st.container(key="filter_count")
+        filter_panel = st.container()
+        with st.expander("Sale list & county data"):
+            uploaded = st.file_uploader("Upload a sale list", help="CSV or Excel. Convert PDFs before upload. Max Return Bid or Max Bid can override the calculated threshold.")
+            st.caption(uploaded.name if uploaded else "Historical 2024 sale list")
+            refresh = st.button("Refresh county data")
+            st.caption("Investor UI development · v6.3")
 
     try:
         tax_df = load_tax_sale_file(uploaded)
@@ -1882,7 +1841,7 @@ def main() -> None:
     if tax_df.empty:
         st.info("No usable unique parcels remain. Upload a list with parcel IDs and nonnegative numeric bids.")
         st.stop()
-    if st.sidebar.button("Refresh county data"):
+    if refresh:
         fetch_parcels.clear()
 
     with st.spinner("Matching tax map numbers to official county parcel polygons…"):
@@ -1922,64 +1881,8 @@ def main() -> None:
         if 1700 <= value <= 2100
     ]
 
-    with st.sidebar:
-        st.header("Acquisition Filters")
-        st.caption("Investor UI development · v6.3")
-        search_text = st.text_input(
-            "Search",
-            placeholder="Owner, address, item, parcel…",
-        )
-        st.subheader("Bid ranges")
-        st.caption("Choose the ranges to display. Colors match the map key.")
-        st.markdown(
-            """
-            <style>
-              [data-testid="stSidebar"] [data-testid="stCheckbox"] {
-                margin-top: -0.45rem;
-                margin-bottom: -0.35rem;
-              }
-              [data-testid="stSidebar"] div[data-testid="stHorizontalBlock"] {
-                gap: 0.45rem;
-              }
-            </style>
-            """,
-            unsafe_allow_html=True,
-        )
-
-        selected_categories: list[str] = []
-        filter_columns = st.columns(2, gap="small")
-        for idx, (label, _, _, color) in enumerate(BID_CATEGORIES):
-            with filter_columns[idx % 2]:
-                swatch_col, checkbox_col = st.columns([0.12, 0.88], gap="small")
-                with swatch_col:
-                    st.markdown(
-                        (
-                            "<div style='width:15px;height:15px;"
-                            f"background:{color};border:1px solid #444;"
-                            "border-radius:4px;margin-top:7px;'></div>"
-                        ),
-                        unsafe_allow_html=True,
-                    )
-                with checkbox_col:
-                    checked = st.checkbox(
-                        label,
-                        value=True,
-                        key=f"bid_range_{idx}",
-                    )
-                if checked:
-                    selected_categories.append(label)
-        if bid_min == bid_max:
-            selected_bid = (bid_min, bid_max)
-            st.caption(f"All loaded bids: {format_currency(bid_min)}")
-        else:
-            selected_bid = st.slider(
-                "Bid amount", min_value=bid_min, max_value=bid_max,
-                value=(bid_min, bid_max), format="$%.2f",
-            )
-
-        st.divider()
-        st.subheader("Property Criteria")
-
+    with filter_panel:
+        search_text = st.text_input("Search properties", placeholder="Address, owner, item or parcel", key="filter_search")
         property_class_options = [
             "Residential",
             "Commercial",
@@ -1991,7 +1894,7 @@ def main() -> None:
         quick_property_view = st.radio(
             "Quick view",
             options=["All", "Residential", "Commercial"],
-            horizontal=True,
+            horizontal=True, key="filter_view",
             index=0,
             help=(
                 "Use this for a fast Residential or Commercial view. "
@@ -1999,102 +1902,115 @@ def main() -> None:
             ),
         )
 
-        detailed_property_classes = st.multiselect(
-            "Property class",
-            options=property_class_options,
-            default=property_class_options,
-            disabled=quick_property_view != "All",
-            help=(
-                "Investor-friendly classification derived from the county's "
-                "Property Type, Land Use, and Building Type fields. These are heuristic classifications, not verified zoning. "
-                "This detailed selector is active when Quick view is set to All."
-            ),
-        )
+        with st.expander("Bid filters"):
+            selected_categories = []
+            for idx, (label, _, _, color) in enumerate(BID_CATEGORIES):
+                st.markdown(f"<style>.st-key-bid_range_{idx} label p::before {{content:' ';display:inline-block;width:.65rem;height:.65rem;background:{color};border-radius:2px;margin-right:.45rem}}</style>", unsafe_allow_html=True)
+                if st.checkbox(label, value=True, key=f"bid_range_{idx}"):
+                    selected_categories.append(label)
+            if bid_min == bid_max:
+                selected_bid = (bid_min, bid_max)
+                st.caption(f"All loaded bids: {format_currency(bid_min)}")
+            else:
+                selected_bid = st.slider(
+                    "Bid amount", key="filter_bid", min_value=bid_min, max_value=bid_max,
+                    value=(bid_min, bid_max), format="$%.2f",
+                )
 
-        if quick_property_view == "Residential":
-            selected_property_classes = ["Residential"]
-        elif quick_property_view == "Commercial":
-            selected_property_classes = ["Commercial"]
-        else:
-            selected_property_classes = detailed_property_classes
-
-        if quick_property_view != "All":
-            st.caption(
-                f"Quick View active: {quick_property_view} properties only."
+        with st.expander("Property details"):
+            detailed_property_classes = st.multiselect(
+                "Property class", key="filter_classes",
+                options=property_class_options,
+                default=property_class_options,
+                disabled=quick_property_view != "All",
+                help=(
+                    "Investor-friendly classification derived from the county's "
+                    "Property Type, Land Use, and Building Type fields. These are heuristic classifications, not verified zoning. "
+                    "This detailed selector is active when Quick view is set to All."
+                ),
             )
 
-        bedroom_choice = st.selectbox(
-            "Minimum bedrooms",
-            options=["Any", 1, 2, 3, 4, 5],
-            index=0,
-            format_func=lambda value: "5+" if value == 5 else str(value),
-        )
-        min_bedrooms = None if bedroom_choice == "Any" else int(bedroom_choice)
+            if quick_property_view == "Residential":
+                selected_property_classes = ["Residential"]
+            elif quick_property_view == "Commercial":
+                selected_property_classes = ["Commercial"]
+            else:
+                selected_property_classes = detailed_property_classes
 
-        bath_choice = st.selectbox(
-            "Minimum full baths",
-            options=["Any", 1, 2, 3, 4],
-            index=0,
-            format_func=lambda value: "4+" if value == 4 else str(value),
-        )
-        min_full_baths = None if bath_choice == "Any" else int(bath_choice)
-
-        acreage_filter = None
-        if acreage_values:
-            acreage_default = (
-                float(math.floor(min(acreage_values) * 10) / 10),
-                float(math.ceil(max(acreage_values) * 10) / 10),
+            bedroom_choice = st.selectbox(
+                "Minimum bedrooms", key="filter_beds",
+                options=["Any", 1, 2, 3, 4, 5],
+                index=0,
+                format_func=lambda value: "5+" if value == 5 else str(value),
             )
-            if acreage_default[0] < acreage_default[1]:
-                selected_acreage = st.slider(
-                    "Acreage",
-                    min_value=acreage_default[0],
-                    max_value=acreage_default[1],
-                    value=acreage_default,
-                    step=0.1,
-                    format="%.1f ac",
-                )
-                if selected_acreage != acreage_default:
-                    acreage_filter = selected_acreage
+            min_bedrooms = None if bedroom_choice == "Any" else int(bedroom_choice)
 
-        living_area_filter = None
-        if living_area_values:
-            living_min = int(math.floor(min(living_area_values) / 100) * 100)
-            living_max = int(math.ceil(max(living_area_values) / 100) * 100)
-            if living_min < living_max:
-                selected_living = st.slider(
-                    "Living area",
-                    min_value=living_min,
-                    max_value=living_max,
-                    value=(living_min, living_max),
-                    step=100,
-                    format="%d sq ft",
+            bath_choice = st.selectbox(
+                "Minimum full baths", key="filter_baths",
+                options=["Any", 1, 2, 3, 4],
+                index=0,
+                format_func=lambda value: "4+" if value == 4 else str(value),
+            )
+            min_full_baths = None if bath_choice == "Any" else int(bath_choice)
+
+            acreage_filter = None
+            if acreage_values:
+                acreage_default = (
+                    float(math.floor(min(acreage_values) * 10) / 10),
+                    float(math.ceil(max(acreage_values) * 10) / 10),
                 )
-                if selected_living != (living_min, living_max):
-                    living_area_filter = (
-                        float(selected_living[0]),
-                        float(selected_living[1]),
+                if acreage_default[0] < acreage_default[1]:
+                    selected_acreage = st.slider(
+                        "Acreage", key="filter_acres",
+                        min_value=acreage_default[0],
+                        max_value=acreage_default[1],
+                        value=acreage_default,
+                        step=0.1,
+                        format="%.1f ac",
                     )
+                    if selected_acreage != acreage_default:
+                        acreage_filter = selected_acreage
 
-        year_built_filter = None
-        if year_built_values:
-            year_min = int(min(year_built_values))
-            year_max = int(max(year_built_values))
-            if year_min < year_max:
-                selected_year = st.slider(
-                    "Year built",
-                    min_value=year_min,
-                    max_value=year_max,
-                    value=(year_min, year_max),
-                    step=1,
-                )
-                if selected_year != (year_min, year_max):
-                    year_built_filter = selected_year
+            living_area_filter = None
+            if living_area_values:
+                living_min = int(math.floor(min(living_area_values) / 100) * 100)
+                living_max = int(math.ceil(max(living_area_values) / 100) * 100)
+                if living_min < living_max:
+                    selected_living = st.slider(
+                        "Living area", key="filter_area",
+                        min_value=living_min,
+                        max_value=living_max,
+                        value=(living_min, living_max),
+                        step=100,
+                        format="%d sq ft",
+                    )
+                    if selected_living != (living_min, living_max):
+                        living_area_filter = (
+                            float(selected_living[0]),
+                            float(selected_living[1]),
+                        )
 
-        st.caption(
-            "Property filters use county assessor data. Parcels with missing "
-            "building data remain visible until you narrow a related filter."
-        )
+            year_built_filter = None
+            if year_built_values:
+                year_min = int(min(year_built_values))
+                year_max = int(max(year_built_values))
+                if year_min < year_max:
+                    selected_year = st.slider(
+                        "Year built", key="filter_year",
+                        min_value=year_min,
+                        max_value=year_max,
+                        value=(year_min, year_max),
+                        step=1,
+                    )
+                    if selected_year != (year_min, year_max):
+                        year_built_filter = selected_year
+
+            st.caption(
+                "Property filters use county assessor data. Parcels with missing "
+                "building data remain visible until you narrow a related filter."
+            )
+
+        st.button("Reset filters", on_click=reset_property_filters)
 
     filtered_geojson = filter_geojson(
         merged_geojson,
@@ -2110,6 +2026,7 @@ def main() -> None:
         year_built_range=year_built_filter,
     )
     visible_count = parcel_count(filtered_geojson)
+    count_slot.markdown(f"**{visible_count:,}** of {matched_count:,} mapped parcels")
 
     avg_bid = (
         f"{tax_df['Bid Amount'].mean():,.0f}"
