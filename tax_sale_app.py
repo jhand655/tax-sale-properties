@@ -5,6 +5,7 @@ import json
 import math
 import re
 import threading
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -568,6 +569,19 @@ def fetch_parcels(tax_maps: tuple[str, ...]) -> dict[str, Any]:
             "fetched_at": datetime.now(timezone.utc).isoformat()}
 
 
+MAX_REDEMPTION_RATE = Decimal("0.12")
+
+
+def full_rate_bid(opening_bid):
+    cents = Decimal(str(opening_bid)) * 100
+    return float((cents / MAX_REDEMPTION_RATE).to_integral_value(rounding=ROUND_DOWN) / 100)
+
+
+def capped_bid_return(bid, opening_bid):
+    interest = min(Decimal(str(bid)) * MAX_REDEMPTION_RATE, Decimal(str(opening_bid)))
+    return float(interest.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
 def load_tax_sale_file(uploaded_file: Any | None) -> pd.DataFrame:
     """Load the included CSV or a user-selected CSV/Excel tax-sale list."""
     source = uploaded_file if uploaded_file is not None else DEFAULT_CSV
@@ -658,6 +672,11 @@ def load_tax_sale_file(uploaded_file: Any | None) -> pd.DataFrame:
         invalid_max = clean[MAX_RETURN_BID_COLUMN].map(
             lambda v: numeric_value(v) is None or float(v) < 0)
         clean.loc[invalid_max, MAX_RETURN_BID_COLUMN] = float("nan")
+    calculated = clean["Bid Amount"].map(full_rate_bid)
+    if MAX_RETURN_BID_COLUMN in clean:
+        clean[MAX_RETURN_BID_COLUMN] = clean[MAX_RETURN_BID_COLUMN].fillna(calculated)
+    else:
+        clean[MAX_RETURN_BID_COLUMN] = calculated
     clean.attrs["review_rows"] = pd.concat([invalid, duplicates], ignore_index=True)
     clean.attrs["source_rows"] = len(df)
 
@@ -1523,6 +1542,15 @@ def render_lien_review_workspace(
             st.query_params.pop("lien_review", None)
             st.rerun()
 
+    opening_bid = props.get("BidAmount")
+    with st.expander("Bid return calculator"):
+        st.write(f"Opening tax bid and interest cap: {format_currency(opening_bid)}")
+        st.write(f"Highest bid earning the full 12%: {format_currency(full_rate_bid(opening_bid))}")
+        proposed = st.number_input("Your proposed bid ($)", min_value=0.0, step=0.01,
+                                   value=full_rate_bid(opening_bid), key=f"proposed_bid_{tax_map}")
+        st.metric("Maximum redemption interest", format_currency(capped_bid_return(proposed, opening_bid)))
+        st.caption("Assumes redemption in months 10–12. Earlier redemption uses a lower rate.")
+
     st.markdown("#### Automatic parcel/title identifiers")
     id1, id2, id3 = st.columns(3)
     with id1:
@@ -1705,7 +1733,7 @@ def main() -> None:
         )
         st.caption(
             "Supported uploads: CSV and Excel. Use the optional column heading "
-            "'Max Return Bid' to show that value in parcel details. Older files "
+            "'Max Return Bid' to override the calculated bid threshold. Older files "
             "using 'Max Bid' remain compatible. PDF lists must be converted to "
             "a spreadsheet before loading."
         )
@@ -2060,7 +2088,7 @@ def main() -> None:
             <div class="footer-note">
               Parcel boundaries, acreage, building characteristics, and county values come from
               Spartanburg County GIS/assessor data. Tax-sale owner, address, item number, bid,
-              and optional Max Return Bid come from the uploaded spreadsheet.
+              and opening tax bid come from the sale list. Max Return Bid uses the supplied override or the opening bid divided by 12%, rounded down to cents.
             </div>
             """,
             unsafe_allow_html=True,
