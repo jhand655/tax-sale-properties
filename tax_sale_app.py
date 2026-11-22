@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import html
+import os
 import json
 import math
 import re
 import threading
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -1700,6 +1701,129 @@ def render_lien_review_workspace(
     return reviews
 
 
+def county_comps(props, center, radius, days):
+    cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
+    lat, lon = center
+    fields = "MAPNUMBER,PropertyLocation,BuildingType,SaleDate,SaleAmount,LivingArea,BedRooms,FullBaths,HalfBaths,YearBuilt,Acreage"
+    with get_session() as session:
+        data = county_query(session, {
+            "where": f"SaleDate >= DATE '{cutoff.isoformat()}' AND SaleAmount > 0 AND LivingArea > 0",
+            "geometry": f"{lon},{lat}", "geometryType": "esriGeometryPoint", "inSR": "4326",
+            "distance": radius, "units": "esriSRUnit_StatuteMile", "spatialRel": "esriSpatialRelIntersects",
+            "outFields": fields, "returnGeometry": "false", "f": "json",
+        })
+    if data.get("exceededTransferLimit") or "features" not in data:
+        raise ValueError("County results were incomplete. Try a smaller search.")
+    rows = []
+    subject_type = str(props.get("BuildingType") or "").strip().lower()
+    subject_size = numeric_value(props.get("LivingArea"))
+    seen = {normalize_tax_map(props["TaxMapNumber"])}
+    for feature in data["features"]:
+        p = feature.get("attributes") or {}
+        parcel = normalize_tax_map(p.get("MAPNUMBER"))
+        size = numeric_value(p.get("LivingArea"))
+        if not parcel or parcel in seen or not size:
+            continue
+        if not subject_type or str(p.get("BuildingType") or "").strip().lower() != subject_type:
+            continue
+        if subject_size and abs(size / subject_size - 1) > .25:
+            continue
+        if any(abs(a - b) > 1 for field in ("BedRooms", "FullBaths")
+               if (a := numeric_value(props.get(field))) is not None
+               and (b := numeric_value(p.get(field))) is not None):
+            continue
+        seen.add(parcel)
+        rows.append({"Parcel": parcel, "Address": p.get("PropertyLocation"), "Price": p["SaleAmount"],
+                     "Sq ft": size, "Date": format_arcgis_date(p["SaleDate"]), "Beds": p.get("BedRooms"),
+                     "Full baths": p.get("FullBaths"), "Year built": p.get("YearBuilt"), "Acres": p.get("Acreage")})
+    return rows
+
+
+def render_comps(feature):
+    props = feature["properties"]
+    st.write(props.get("SalePropertyAddress") or props["TaxMapNumber"])
+    st.metric("County appraised value", format_currency(props.get("AppraisedTotal")))
+    if props.get("PropertyClass") != "Residential":
+        st.info("Residential comps require a parcel classified as Residential.")
+        return
+    center = parcel_label_location(feature["geometry"])
+    if not center:
+        st.info("Parcel coordinates unavailable.")
+        return
+    source = st.radio("Comp source", ["County recorded sales", "RentCast listings"], horizontal=True)
+    county = source == "County recorded sales"
+    radius = st.selectbox("Radius (miles)", [0.5, 1.0, 2.0, 5.0], index=1)
+    days = st.selectbox("Lookback (days)", [90, 180, 365, 730], index=2)
+    count = None
+    key = None
+    if county:
+        st.caption("County transfers within the radius, matched by building type, living area (±25%) and available bed/full-bath counts (±1). Inspect transfers for non-market prices.")
+    else:
+        count = st.slider("Requested listings", 5, 25, 10)
+        st.caption("RentCast prices are listing prices. Lookback measures days since the listing was seen.")
+        key = os.environ.get("RENTCAST_API_KEY")
+        if not key:
+            try:
+                key = st.secrets.get("RENTCAST_API_KEY")
+            except FileNotFoundError:
+                pass
+        if not key:
+            st.info("Add RENTCAST_API_KEY to Streamlit Secrets to enable RentCast.")
+    query = (props["TaxMapNumber"], center, source, radius, days, count, props.get("LivingArea"), props.get("BuildingType"), props.get("BedRooms"), props.get("FullBaths"))
+    cache = st.session_state.setdefault("comp_results", {})
+    if query not in cache and st.button("Find comps", disabled=not county and not key):
+        try:
+            avm = {}
+            if county:
+                rows = county_comps(props, center, radius, days)
+            else:
+                params = dict(latitude=center[0], longitude=center[1], maxRadius=radius, daysOld=days, compCount=count)
+                for field, attr in [("squareFootage", "LivingArea"), ("bedrooms", "BedRooms")]:
+                    value = numeric_value(props.get(attr))
+                    if value and value > 0:
+                        params[field] = value
+                response = requests.get("https://api.rentcast.io/v1/avm/value", params=params,
+                                        headers={"X-Api-Key": key}, timeout=(5, 25))
+                response.raise_for_status()
+                avm = response.json()
+                if not isinstance(avm, dict) or not isinstance(avm.get("comparables"), list):
+                    raise ValueError("Unexpected RentCast response.")
+                rows = [{"Address": c.get("formattedAddress"), "Price": c.get("price"),
+                         "Sq ft": c.get("squareFootage"), "Last seen": c.get("lastSeenDate"),
+                         "Distance (mi)": c.get("distance"), "Type": c.get("propertyType")}
+                        for c in avm["comparables"] if isinstance(c, dict)]
+            cache[query] = rows, avm
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            st.error(f"Lookup failed: {exc}")
+    if query not in cache:
+        return
+    rows, avm = cache[query]
+    if avm:
+        st.metric("RentCast estimated value", format_currency(avm.get("price")))
+        st.caption(f"Provider range: {format_currency(avm.get('priceRangeLow'))} to {format_currency(avm.get('priceRangeHigh'))}")
+    if not rows:
+        st.info("No qualifying comps returned for these settings.")
+        return
+    df = pd.DataFrame(rows)
+    df.insert(0, "Include", True)
+    edited = st.data_editor(df, hide_index=True, disabled=list(df.columns[1:]),
+                            key=f"comps_{query}", width="stretch")
+    selected = edited[edited["Include"]]
+    prices = pd.to_numeric(selected["Price"], errors="coerce")
+    areas = pd.to_numeric(selected["Sq ft"], errors="coerce")
+    unit = (prices / areas)[(prices > 0) & (areas > 0)]
+    st.write(f"Median included price: {format_currency(prices[prices > 0].median())}" if any(prices > 0) else "No priced comps selected.")
+    size = numeric_value(props.get("LivingArea"))
+    if len(unit):
+        st.write(f"Median price per sq ft: {format_currency(unit.median())} · {len(unit)} usable comps")
+    if len(unit) >= 3 and size and size > 0:
+        estimate = unit.median() * size
+        st.metric("Comp-based value estimate", format_currency(estimate))
+        st.write(f"Opening bid / comp-based value: {props['BidAmount'] / estimate:.1%}")
+    else:
+        st.caption("A value estimate needs subject living area and at least three included comps with price and area.")
+
+
 def main() -> None:
     configure_page()
     render_hero()
@@ -2047,6 +2171,10 @@ def main() -> None:
             )
 
     review_ids = sorted({str(f["properties"]["TaxMapNumber"]) for f in merged_geojson["features"]})
+    with st.expander("Value & Comps"):
+        comp_id = st.selectbox("Choose a parcel for comps", review_ids, index=None)
+        if comp_id:
+            render_comps(find_feature_by_tax_map(merged_geojson, comp_id))
     selection = st.selectbox("Open lien review by tax map number", review_ids, index=None, key="review_selection")
     selected_review = selection or st.query_params.get("lien_review")
     if selected_review:
