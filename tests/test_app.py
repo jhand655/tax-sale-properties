@@ -184,3 +184,24 @@ def test_unpublished_county_bids_are_mappable(monkeypatch):
     assert not missing
     assert merged["features"][0]["properties"]["BidAmount"] is None
     assert merged["features"][0]["properties"]["MaxReturnBid"] is None
+
+
+def test_separate_mobile_home_list_is_optional_and_preserves_unit_ids(monkeypatch):
+    import market_library as library
+    page = b"""2026 Delinquent Tax Sale Lists
+    <a href="/land">Real Estate Sales Tax List</a>
+    <a href="/homes">Mobile Home Sales Tax List</a>"""
+    monkeypatch.setattr(library, "download", lambda url, source: page if url == source else url)
+    def records(url):
+        ids = ["001 A", "001 B"] if url.endswith("/homes") else ["001"]
+        return [{"Tax Map Number": key} for key in ids]
+    monkeypatch.setattr(library, "read_list", records)
+    listing = library.fetch_listing()
+    assert listing["rows"] == [{"Tax Map Number": "001"}]
+    assert listing["mobile"]["rows"] == [
+        {"Tax Map Number": key, "Sale list": "Mobile homes"} for key in ("001 A", "001 B")]
+    page = page.replace(b"Mobile Home Sales Tax List", b"Unavailable")
+    listing = library.fetch_listing()
+    assert listing["rows"] and "error" in listing["mobile"]
+    market = dict(library.SPARTANBURG, lists={"Real estate": "real estate sales tax list"})
+    assert "mobile" not in library.fetch_listing(market)
