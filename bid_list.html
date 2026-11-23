@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>My bid list</title>
+<style>
+*{box-sizing:border-box}body{margin:0;font:15px system-ui;color:#182633;background:white}button,input,textarea,select{font:inherit;padding:8px;border:1px solid #aab8bf;border-radius:5px;max-width:100%}button{cursor:pointer;background:white}button.primary{background:#146d53;color:white}form,article{padding:14px;border:1px solid #d7e0e3;border-radius:8px;margin-bottom:10px}label{display:grid;gap:3px;margin:6px 0}textarea{width:100%}h3,p{margin:4px 0 8px}.fields{display:flex;flex-wrap:wrap;gap:12px}.fields label{flex:1;min-width:150px}footer{position:sticky;bottom:0;background:#173347;color:white;padding:14px;border-radius:6px;font-size:18px}small{color:#526575}#records{max-height:400px;overflow:auto}#notice{color:#8b351a}
+</style>
+<form id="addForm"><label>Property to add<input id="parcel" list="choices" required placeholder="Search by tax map number or address" autocomplete="off"></label><datalist id="choices"></datalist><button class="primary">Add to bid list</button></form>
+<p id="notice" role="status"></p><div id="records"></div><footer>Total spent · <strong id="total"></strong></footer>
+<template id="row"><article><h3></h3><small></small><div class="fields"><label>Outcome<select name="status"><option>Planning</option><option>Won</option><option>Outbid</option></select></label><label>Actual final bid ($)<input name="amount" type="number" min="0" step="0.01" inputmode="decimal"></label></div><label>Notes<textarea name="notes" rows="2"></textarea></label><button type="button">Remove property</button></article></template>
+<script>
+const {sale,properties,pending}=__BID_DATA__;
+const prefix="spartanburg:bid-list:v1:";
+const money=new Intl.NumberFormat("en-US",{style:"currency",currency:"USD"});
+const records=document.querySelector("#records"),notice=document.querySelector("#notice"),total=document.querySelector("#total");
+const parcel=document.querySelector("#parcel"), choices=document.querySelector("#choices");
+function recordKey(id){return prefix+JSON.stringify([sale,id])}
+const byId=new Map(properties.map(p=>[p.id,p]));
+for(const p of properties){const o=document.createElement("option");o.value=p.id;o.label=p.address;choices.append(o)}
+function saved(){
+ return Object.keys(localStorage).filter(k=>k.startsWith(prefix)).map(k=>[k,JSON.parse(localStorage.getItem(k))]);
+}
+function updateTotal(entries){
+ let cents=0,missing=0;
+ for(const [,p] of entries){if(p.status==="Won"){if(p.cents===null)missing++;else cents+=p.cents}}
+ total.textContent=money.format(cents/100)+(missing?" · "+missing+" won without an amount":"");
+}
+function draw(){
+ const entries=saved();records.replaceChildren();
+ if(!entries.length)records.textContent="Your bid list is empty.";
+ for(const [key,p] of entries.sort((a,b)=>b[1].added-a[1].added)){
+  const card=document.querySelector("#row").content.cloneNode(true);
+  card.querySelector("h3").textContent=p.address||p.id;card.querySelector("small").textContent=p.id+" · "+p.sale;
+  const status=card.querySelector("select"),amount=card.querySelector("input"),notes=card.querySelector("textarea");
+  status.value=p.status;amount.value=p.cents===null?"":(p.cents/100).toFixed(2);notes.value=p.notes;
+  function save(field,value){
+   try{const latest=JSON.parse(localStorage.getItem(key));if(!latest){draw();return}
+    latest[field]=value;localStorage.setItem(key,JSON.stringify(latest));notice.textContent="";updateTotal(saved());
+   }catch{notice.textContent="Could not save this edit in your browser."}
+  }
+  status.onchange=()=>save("status",status.value);
+  amount.oninput=()=>{if(!amount.validity.valid){notice.textContent="Enter a nonnegative amount with up to two decimal places.";return}
+   save("cents",amount.value===""?null:Math.round(Number(amount.value)*100))};
+  notes.oninput=()=>save("notes",notes.value);
+  card.querySelector("button").onclick=()=>{if(confirm("Remove this property and its bid notes?")){localStorage.removeItem(key);draw()}};
+  records.append(card);
+ }
+ updateTotal(entries);
+}
+function add(id){
+ const p=byId.get(id);if(!p){notice.textContent="Select a parcel from the current sale list.";return}
+ const key=recordKey(id);
+ if(!localStorage.getItem(key))localStorage.setItem(key,JSON.stringify({...p,sale,added:Date.now(),status:"Planning",cents:null,notes:""}));
+ parcel.value="";notice.textContent="Property is on your bid list.";draw();
+}
+try{
+ document.querySelector("#addForm").onsubmit=e=>{e.preventDefault();try{add(parcel.value.trim())}catch{notice.textContent="Could not save this parcel."}};
+ if(pending)add(pending);else draw();
+ window.addEventListener("storage",e=>{if(!e.key||e.key.startsWith(prefix))draw()});
+}catch{notice.textContent="Your browser could not open saved bids. Enable site storage to use the bid list.";total.textContent="Unavailable"}
+</script></html>
