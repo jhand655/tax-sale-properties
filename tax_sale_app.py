@@ -12,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from market_library import PAGE, fetch_listing
+
 import folium
 import pandas as pd
 import requests
@@ -639,6 +641,9 @@ def load_tax_sale_file(uploaded_file: Any | None) -> pd.DataFrame:
         clean[column] = pd.to_numeric(clean[column], errors="coerce")
 
     valid_bid = clean["Bid Amount"].map(lambda v: numeric_value(v) is not None and float(v) >= 0)
+    county_list = getattr(uploaded_file, "county_list", False)
+    if county_list:
+        valid_bid |= clean["Bid Amount"].isna()
     valid_id = clean["Tax Map Number"].ne("")
     invalid = clean.loc[~(valid_id & valid_bid)].copy()
     invalid["Review Reason"] = "Missing parcel ID or invalid/negative bid"
@@ -651,7 +656,7 @@ def load_tax_sale_file(uploaded_file: Any | None) -> pd.DataFrame:
         invalid_max = clean[MAX_RETURN_BID_COLUMN].map(
             lambda v: numeric_value(v) is None or float(v) < 0)
         clean.loc[invalid_max, MAX_RETURN_BID_COLUMN] = float("nan")
-    calculated = clean["Bid Amount"].map(full_rate_bid)
+    calculated = clean["Bid Amount"].map(full_rate_bid, na_action="ignore")
     if MAX_RETURN_BID_COLUMN in clean:
         clean[MAX_RETURN_BID_COLUMN] = clean[MAX_RETURN_BID_COLUMN].fillna(calculated)
     else:
@@ -767,8 +772,8 @@ def merge_tax_data(
         if not valid_geometry(feature.get("geometry")):
             continue
         matched.add(tax_map)
-        bid = float(sale["Bid Amount"])
-        category, color = bid_style(bid)
+        bid = numeric_value(sale["Bid Amount"])
+        category, color = bid_style(bid) if bid is not None else ("Bid unpublished", "#64748b")
         max_bid = sale.get(MAX_RETURN_BID_COLUMN)
         if pd.isna(max_bid):
             max_bid = None
@@ -1209,8 +1214,8 @@ def filter_geojson(
 
     for feature in geojson.get("features", []):
         props = feature.get("properties") or {}
-        bid = float(props.get("BidAmount", 0))
-        if not (min_bid <= bid <= max_bid):
+        bid = numeric_value(props.get("BidAmount"))
+        if bid is not None and not (min_bid <= bid <= max_bid):
             continue
         if props.get("BidCategory") not in selected_categories:
             continue
@@ -1532,13 +1537,17 @@ def render_lien_review_workspace(
             st.rerun()
 
     opening_bid = props.get("BidAmount")
-    with st.expander("Bid return calculator"):
-        st.write(f"Opening tax bid and interest cap: {format_currency(opening_bid)}")
-        st.write(f"Highest bid earning the full 12%: {format_currency(full_rate_bid(opening_bid))}")
-        proposed = st.number_input("Your proposed bid ($)", min_value=0.0, step=0.01,
-                                   value=full_rate_bid(opening_bid), key=f"proposed_bid_{tax_map}")
-        st.metric("Maximum redemption interest", format_currency(capped_bid_return(proposed, opening_bid)))
-        st.caption("Assumes redemption in months 10–12. Earlier redemption uses a lower rate.")
+    if opening_bid is None:
+        st.caption("The county has not published an opening bid for this parcel.")
+    else:
+        with st.expander("Bid return calculator"):
+            st.write(f"Opening tax bid and interest cap: {format_currency(opening_bid)}")
+            st.write(f"Highest bid earning the full 12%: {format_currency(full_rate_bid(opening_bid))}")
+            proposed = st.number_input("Your proposed bid ($)", min_value=0.0, step=0.01,
+                                       value=full_rate_bid(opening_bid), key=f"proposed_bid_{tax_map}")
+            st.metric("Maximum redemption interest", format_currency(capped_bid_return(proposed, opening_bid)))
+            st.caption("Assumes redemption in months 10–12. Earlier redemption uses a lower rate.")
+
 
     st.markdown("#### Automatic parcel/title identifiers")
     id1, id2, id3 = st.columns(3)
@@ -1807,7 +1816,8 @@ def render_comps(feature):
     if len(unit) >= 3 and size and size > 0:
         estimate = unit.median() * size
         st.metric("Comp-based value estimate", format_currency(estimate))
-        st.write(f"Opening bid / comp-based value: {props['BidAmount'] / estimate:.1%}")
+        if props.get("BidAmount") is not None:
+            st.write(f"Opening bid / comp-based value: {props['BidAmount'] / estimate:.1%}")
     else:
         st.caption("A value estimate needs subject living area and at least three included comps with price and area.")
 
@@ -1886,16 +1896,76 @@ def tax_history_workspace(tax_df):
     return history
 
 
+@st.cache_data(ttl=900, show_spinner=False)
+def county_candidate():
+    try:
+        return fetch_listing(), None, datetime.now(timezone.utc).strftime("%H:%M UTC")
+    except Exception as exc:
+        return None, str(exc), datetime.now(timezone.utc).strftime("%H:%M UTC")
+
+
+@st.cache_data(show_spinner=False)
+def historical_market():
+    rows = pd.read_csv(DEFAULT_CSV, dtype=str).fillna("").to_dict("records")
+    return {"year": "2024", "name": "Historical 2024", "rows": rows}
+
+
+market_card = st.components.v2.component(
+    "market_library_card", html="<section></section>",
+    css="""section{padding:1rem;border:1px solid #84929c;border-radius:.6rem}
+    .update{border-left:5px solid #d28a13}h3{margin-top:0}
+    button,summary{cursor:pointer}button{margin-top:1rem;padding:.6rem .85rem}
+    .scroll{max-height:21rem;overflow:auto}td,th{text-align:left;padding:.3rem .5rem}""",
+    js=Path(__file__).with_name("market_library.js").read_text(encoding="utf-8"),
+)
+
+
+@st.fragment(run_every="15m")
+def market_workspace(manual_name, tax_df):
+    st.subheader("My Markets")
+    st.caption("Checks the county every 15 minutes while the app is open. Your selected list is saved in this browser.")
+    if st.button("Check county now"):
+        county_candidate.clear()
+    candidate, error, checked = county_candidate()
+    st.caption(f"Last checked at {checked}")
+    st.link_button("County sale list page", PAGE)
+    if error:
+        st.warning(f"County update check unavailable. {error}")
+    if candidate:
+        st.link_button("View published county document", candidate["url"])
+    manual = None
+    if manual_name:
+        manual = {"name": manual_name, "rows": tax_df.fillna("").astype(str).to_dict("records")}
+    result = market_card(key="spartanburg_market", data={
+        "manual": manual, "baseline": historical_market(), "candidate": candidate,
+    }, on_selection_change=lambda: None)
+    selection = result.selection
+    if selection and (selection != st.session_state.get("last_market_selection")):
+        st.session_state.last_market_selection = selection
+        active = selection.get("active")
+        if active != st.session_state.get("active_market_list") or (manual_name and selection.get("replaced")):
+            st.session_state.active_market_list = active
+            if selection.get("replaced"):
+                st.session_state.market_imports = st.session_state.get("market_imports", 0) + 1
+            st.rerun()
+
+
 def main() -> None:
     configure_page()
     render_hero()
 
+    active = st.session_state.get("active_market_list")
     with st.sidebar:
         st.subheader("Property filters")
         count_slot = st.container(key="filter_count")
         filter_panel = st.container()
         with st.expander("Sale list & county data"):
-            uploaded = st.file_uploader("Upload a sale list", help="CSV or Excel. Convert PDFs before upload. Max Return Bid or Max Bid can override the calculated threshold.")
+            manual = st.file_uploader("Upload a sale list", key=f"manual_sale_{st.session_state.get('market_imports', 0)}", help="CSV or Excel. Convert PDFs before upload. Max Return Bid or Max Bid can override the calculated threshold.")
+            uploaded = manual
+            if active and manual is None:
+                uploaded = io.BytesIO(pd.DataFrame(active["rows"]).to_csv(index=False).encode())
+                uploaded.name = f"Spartanburg {active['year']} real estate.csv"
+                uploaded.county_list = True
             st.caption(uploaded.name if uploaded else "Historical 2024 sale list")
             refresh = st.button("Refresh county data")
             st.caption("Investor UI development · v6.3")
@@ -1906,7 +1976,9 @@ def main() -> None:
         st.error(f"The tax-sale file could not be loaded: {exc}")
         st.stop()
 
-    map_tab, bid_tab, history_tab = st.tabs(["Property map", "My bid list", "Tax history"], key="deal_page", on_change="rerun")
+    map_tab, bid_tab, history_tab, markets_tab = st.tabs(["Property map", "My bid list", "Tax history", "My Markets"], key="deal_page", on_change="rerun")
+    with markets_tab:
+        market_workspace(manual.name if manual else None, tax_df)
     with bid_tab:
         st.caption("Saved in this browser on this device. Total spent includes winning bids across your saved sale lists.")
         properties = [{"id": str(parcel), "address": str(address)}
@@ -1964,8 +2036,9 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
         lien_reviews = {}
     matched_count = parcel_count(merged_geojson)
     st.caption(f"County data fetched (UTC): {parcel_geojson.get('fetched_at', 'unavailable')}. Cached for up to 24 hours.")
-    bid_min = float(tax_df["Bid Amount"].min())
-    bid_max = float(tax_df["Bid Amount"].max())
+    has_bids = tax_df["Bid Amount"].notna().any()
+    bid_min = float(tax_df["Bid Amount"].min()) if has_bids else 0.0
+    bid_max = float(tax_df["Bid Amount"].max()) if has_bids else 0.0
 
     acreage_values = property_numeric_values(
         merged_geojson, "Acreage", positive_only=True
@@ -2008,7 +2081,12 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
                 st.markdown(f"<style>.st-key-bid_range_{idx} label p::before {{content:' ';display:inline-block;width:.65rem;height:.65rem;background:{color};border-radius:2px;margin-right:.45rem}}</style>", unsafe_allow_html=True)
                 if st.checkbox(label, value=True, key=f"bid_range_{idx}"):
                     selected_categories.append(label)
-            if bid_min == bid_max:
+            if tax_df["Bid Amount"].isna().any() and st.checkbox("Bid unpublished", value=True):
+                selected_categories.append("Bid unpublished")
+            if not has_bids:
+                selected_bid = (0.0, 0.0)
+                st.caption("Opening bids have not been published.")
+            elif bid_min == bid_max:
                 selected_bid = (bid_min, bid_max)
                 st.caption(f"All loaded bids: {format_currency(bid_min)}")
             else:
@@ -2139,8 +2217,8 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
 
     avg_bid = (
         f"{tax_df['Bid Amount'].mean():,.0f}"
-        if not tax_df.empty
-        else "0"
+        if has_bids
+        else "—"
     )
     max_return_series = (
         pd.to_numeric(tax_df[MAX_RETURN_BID_COLUMN], errors="coerce")
@@ -2184,7 +2262,7 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
         if MAX_RETURN_BID_COLUMN in tax_df.columns:
             render_stat_card(
                 "Within Max Return",
-                f"{opportunity_count:,}",
+                f"{opportunity_count:,}" if has_bids else "—",
                 "Loaded properties where current bid is at or below Max Return Bid.",
                 tone="gold",
             )
