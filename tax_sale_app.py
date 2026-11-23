@@ -1919,9 +1919,15 @@ def market_check(state, manual):
 
 
 @st.cache_data(show_spinner=False)
-def historical_market():
-    rows = pd.read_csv(DEFAULT_CSV, dtype=str).fillna("").to_dict("records")
-    return {"year": "2024", "name": "Historical 2024", "rows": rows}
+def bundled_market():
+    path = Path(__file__).with_name("Spartanburg_2026_11_23.csv")
+    frame = pd.read_csv(path, dtype=str, keep_default_na=False)
+    homes = frame["Sale list"].eq("Mobile homes")
+    return {"year": "2026", "name": "2026 county list · verified November 23, 2026",
+            "rows": frame.loc[~homes].drop(columns="Sale list").to_dict("records"),
+            "mobile": {"rows": frame.loc[homes].to_dict("records")}}
+
+
 
 
 market_card = st.components.v2.component(
@@ -2001,10 +2007,12 @@ def market_workspace(manual_name, tax_df):
         candidate = county_pdf_fallback(candidate)
     manual = None
     if manual_name:
-        manual = {"name": manual_name, "rows": tax_df.fillna("").astype(str).to_dict("records")}
+        comparison = tax_df.copy(deep=False)
+        comparison.attrs = {}
+        manual = {"name": manual_name, "rows": comparison.astype("string").fillna("").to_dict("records")}
     result = market_card(key=f"{SPARTANBURG['key']}_market", data={
         "market": {"key": SPARTANBURG["key"], "name": SPARTANBURG["name"]},
-        "manual": manual, "baseline": historical_market(), "candidate": candidate,
+        "manual": manual, "baseline": bundled_market(), "candidate": candidate,
     }, on_selection_change=lambda: None)
     selection = result.selection
     if selection and (selection != st.session_state.get("last_market_selection")):
@@ -2021,19 +2029,23 @@ def main() -> None:
     configure_page()
     render_hero()
 
-    active = st.session_state.get("active_market_list")
+    active = st.session_state.get("active_market_list") or bundled_market()
     with st.sidebar:
         st.subheader("Property filters")
         count_slot = st.container(key="filter_count")
         filter_panel = st.container()
         with st.expander("Sale list & county data"):
             manual = st.file_uploader("Upload a sale list", key=f"manual_sale_{st.session_state.get('market_imports', 0)}", help="CSV or Excel. Convert PDFs before upload. Max Return Bid or Max Bid can override the calculated threshold.")
+            archive = st.checkbox("View historical 2024 list", key=f"archive_sale_{st.session_state.get('market_imports', 0)}",
+                                  disabled=manual is not None)
             uploaded = manual
-            if active and manual is None:
+            if manual is None and not archive:
                 uploaded = io.BytesIO(pd.DataFrame(active["rows"]).to_csv(index=False).encode())
                 uploaded.name = f"Spartanburg {active['year']} real estate.csv"
                 uploaded.county_list = True
-                uploaded.display_name = f"Spartanburg {active['year']} · Real estate and mobile homes" if active.get("includeMobile") else uploaded.name
+                uploaded.display_name = active.get("name") or uploaded.name
+                if active.get("includeMobile"):
+                    uploaded.display_name += " · Includes mobile homes"
             st.caption(getattr(uploaded, "display_name", uploaded.name) if uploaded else "Historical 2024 sale list")
             refresh = st.button("Refresh county data")
             st.caption("Investor UI development · v6.3")
@@ -2046,7 +2058,7 @@ def main() -> None:
 
     map_tab, bid_tab, history_tab, markets_tab = st.tabs(["Property map", "My bid list", "Tax history", "My Markets"], key="deal_page", on_change="rerun")
     with markets_tab:
-        market_workspace(manual.name if manual else None, tax_df)
+        market_workspace(manual.name if manual else ("Historical 2024" if archive else None), tax_df)
     mobile = tax_df.get("Sale list", pd.Series("", index=tax_df.index)).eq("Mobile homes").fillna(False)
     with bid_tab:
         st.caption("Saved in this browser on this device. Total spent includes winning bids across your saved sale lists.")
