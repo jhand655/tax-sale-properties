@@ -1,4 +1,4 @@
-"""Discover Spartanburg's published real-estate list and read every table page."""
+"""Discover configured county sale lists and read their published tables."""
 from html.parser import HTMLParser
 from io import BytesIO
 import re
@@ -8,7 +8,13 @@ import pdfplumber
 import requests
 
 PAGE = "https://www.spartanburgcounty.gov/640/2026-Tax-Sale-Info"
+SPARTANBURG = {
+    "key": "spartanburg", "name": "Spartanburg County, South Carolina", "page": PAGE,
+    "lists": {"Real estate": r"real estate (?:sales? tax |tax sale )?list",
+              "Mobile homes": r"mobile homes? (?:sales? tax |tax sale )?list"},
+}
 HEADINGS = {
+    "map+mh#": "Tax Map Number",
     "item number": "Item Number", "item #": "Item Number",
     "map number": "Tax Map Number", "tax map number": "Tax Map Number",
     "owner name": "Owner Name", "defaulting taxpayer owner name": "Owner Name",
@@ -20,11 +26,12 @@ REQUIRED = {"Item Number", "Tax Map Number", "Owner Name", "Property Address"}
 
 
 class ListingPage(HTMLParser):
-    def __init__(self):
+    def __init__(self, market):
         super().__init__()
         self.href = None
         self.label = []
-        self.links = []
+        self.market = market
+        self.links = {kind: set() for kind in market["lists"]}
         self.text = []
 
     def handle_starttag(self, tag, attrs):
@@ -40,13 +47,14 @@ class ListingPage(HTMLParser):
     def handle_endtag(self, tag):
         if tag == "a" and self.href:
             label = " ".join(" ".join(self.label).lower().split())
-            if re.fullmatch(r"real estate (?:sales? tax |tax sale )?list", label):
-                self.links.append(urljoin(PAGE, self.href))
+            for kind, pattern in self.market["lists"].items():
+                if re.fullmatch(pattern, label):
+                    self.links[kind].add(urljoin(self.market["page"], self.href))
             self.href = None
 
 
-def download(url):
-    if urlparse(url).scheme != "https" or urlparse(url).hostname != urlparse(PAGE).hostname:
+def download(url, source_page):
+    if urlparse(url).scheme != "https" or urlparse(url).hostname != urlparse(source_page).hostname:
         raise ValueError("County source address has changed.")
     with requests.get(url, timeout=(5, 20), stream=True, allow_redirects=False) as response:
         if response.status_code != 200:
@@ -87,12 +95,32 @@ def read_list(pdf):
     return sorted(rows, key=lambda row: row["Tax Map Number"])
 
 
-def fetch_listing():
-    page = ListingPage()
-    page.feed(download(PAGE).decode("utf-8"))
+def fetch_listing(market=SPARTANBURG):
+    source = market["page"]
+    page = ListingPage(market)
+    page.feed(download(source, source).decode("utf-8"))
     year = re.search(r"\b(20\d\d)\s+Delinquent Tax Sale Lists", " ".join(page.text), re.I)
-    links = set(page.links)
-    if len(links) != 1 or not year:
-        raise ValueError("The county has not posted a recognizable real-estate list.")
-    url = links.pop()
-    return {"year": year[1], "url": url, "rows": read_list(download(url))}
+    if not year:
+        raise ValueError("Unrecognized county sale year.")
+
+    def read_source(kind):
+        links = page.links[kind]
+        if len(links) != 1:
+            raise ValueError(f"The county has not posted a recognizable {kind.lower()} list.")
+        url, = links
+        rows = read_list(download(url, source))
+        return {"url": url, "rows": rows}
+
+    candidate = {"year": year[1], **read_source("Real estate")}
+    if "Mobile homes" in market["lists"]:
+        try:
+            mobile = read_source("Mobile homes")
+            for row in mobile["rows"]:
+                row["Sale list"] = "Mobile homes"
+            if {r["Tax Map Number"] for r in mobile["rows"]}.intersection(
+                    r["Tax Map Number"] for r in candidate["rows"]):
+                raise ValueError("The two lists contain overlapping sale identifiers.")
+            candidate["mobile"] = mobile
+        except Exception as exc:
+            candidate["mobile"] = {"error": str(exc)}
+    return candidate
