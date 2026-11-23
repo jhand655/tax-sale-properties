@@ -236,3 +236,21 @@ def test_check_county_button_retries_immediately(monkeypatch):
     assert not test.exception
     assert any("Manual check · second" in message.value for message in test.success)
     assert fetch.call_count == 2
+
+
+def test_forbidden_check_shows_eastern_date_and_pdf_recovery(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    def forbidden():
+        raise ValueError("The county denied this app access to its sale page (HTTP 403).")
+
+    monkeypatch.setattr(app, "fetch_listing", forbidden)
+    monkeypatch.setattr(app, "fetch_parcels", lambda _: {"features": []})
+    test = AppTest.from_function(launch).run(timeout=20)
+    assert not test.exception
+    stamp = datetime.now(ZoneInfo("America/New_York"))
+    assert any(stamp.strftime("%B %d, %Y") in c.value and stamp.tzname() in c.value
+               for c in test.caption if "Last checked" in c.value)
+    assert any("HTTP 403" in e.value for e in test.error)
+    assert any(u.label == "Real estate PDF" for u in test.get("file_uploader"))
