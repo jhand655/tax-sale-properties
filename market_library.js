@@ -29,7 +29,8 @@ export default function renderMarket({parentElement, data, setStateValue}) {
   const current = data.manual || active || data.baseline;
   add("h3", data.market.name);
   add("p", "Active list · " + (current.name || current.year) + " · " + current.rows.length.toLocaleString() + " listings");
-  const candidate = data.candidate;
+  const useSnapshot = !data.candidate && (!active || current.name === data.baseline.name);
+  const candidate = data.candidate || (useSnapshot ? data.baseline : null);
   if (!candidate) return;
   const {mobile, ...realEstate} = candidate;
   let include = !!current.includeMobile;
@@ -70,8 +71,8 @@ export default function renderMarket({parentElement, data, setStateValue}) {
     }
   }
   for (const [id, row] of oldRows) if (!newRows.has(id)) diffs.push(["Removed", id, (row["Sale list"] === "Mobile homes" ? "Mobile home · " : "") + row["Property Address"]]);
-  if (!diffs.length && current.year === next.year && !!current.includeMobile === !!next.includeMobile) {
-    add("p", "Up to date with the county list."); return;
+  if (!data.manual && !diffs.length && current.year === next.year && !!current.includeMobile === !!next.includeMobile) {
+    add("p", useSnapshot ? "Using the November 23 county copy. Live status is unavailable." : "Up to date with the county list."); return;
   }
   root.classList.add("update");
   add("strong", (!!current.includeMobile !== !!next.includeMobile ? "Review selected lists · " : "Updated list available · ") + next.year);
