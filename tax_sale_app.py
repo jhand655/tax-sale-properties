@@ -7,6 +7,8 @@ import json
 import math
 import re
 import threading
+from time import monotonic
+from zoneinfo import ZoneInfo
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1896,12 +1898,24 @@ def tax_history_workspace(tax_df):
     return history
 
 
-@st.cache_data(ttl=900, show_spinner=False)
 def county_candidate():
     try:
-        return fetch_listing(), None, datetime.now(timezone.utc).strftime("%H:%M UTC")
+        candidate, error = fetch_listing(), None
     except Exception as exc:
-        return None, str(exc), datetime.now(timezone.utc).strftime("%H:%M UTC")
+        candidate, error = None, str(exc)
+    checked = datetime.now(ZoneInfo("America/New_York")).strftime("%b %d, %I:%M:%S %p %Z")
+    return candidate, error, checked
+
+
+def market_check(state, manual):
+    previous = state.get("county_check")
+    if manual or previous is None or monotonic() >= previous["due"]:
+        with st.spinner("Checking the county page and reading the latest sale lists…", show_time=True):
+            candidate, error, checked = county_candidate()
+        previous = {"candidate": candidate, "error": error, "checked": checked,
+                    "due": monotonic() + 900, "mode": "Manual" if manual else "Automatic"}
+        state["county_check"] = previous
+    return previous
 
 
 @st.cache_data(show_spinner=False)
@@ -1920,17 +1934,24 @@ market_card = st.components.v2.component(
 )
 
 
-@st.fragment(run_every="15m")
+@st.fragment(run_every="1m")
 def market_workspace(manual_name, tax_df):
     st.subheader("My Markets")
     st.caption("Checks the county every 15 minutes while the app is open. Your selected list is saved in this browser.")
-    if st.button("Check county now"):
-        county_candidate.clear()
-    candidate, error, checked = county_candidate()
-    st.caption(f"Last checked at {checked}")
+    result = market_check(st.session_state, st.button("Check county now"))
+    candidate, error = result["candidate"], result["error"]
+    status = f"{result['mode']} check · {result['checked']}"
+    if candidate:
+        totals = [f"{len(candidate['rows']):,} real estate listings"]
+        mobile = candidate.get("mobile", {})
+        if "rows" in mobile:
+            totals.append(f"{len(mobile['rows']):,} mobile homes")
+        st.success(f"{status} · Found " + " and ".join(totals) + ".")
+        if mobile.get("error"):
+            st.warning(f"Mobile-home check failed. {mobile['error']}")
     st.link_button("County sale list page", SPARTANBURG["page"])
     if error:
-        st.warning(f"County update check unavailable. {error}")
+        st.error(f"{status} · County check failed. {error}")
     if candidate:
         st.link_button("Real estate list", candidate["url"])
         if candidate.get("mobile", {}).get("url"):
