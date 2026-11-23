@@ -56,7 +56,7 @@ class ListingPage(HTMLParser):
 def download(url, source_page):
     if urlparse(url).scheme != "https" or urlparse(url).hostname != urlparse(source_page).hostname:
         raise ValueError("County source address has changed.")
-    with requests.get(url, timeout=(5, 20), stream=True, allow_redirects=False) as response:
+    with requests.get(url, headers={"Cache-Control": "no-cache"}, timeout=(5, 20), stream=True, allow_redirects=False) as response:
         if response.status_code != 200:
             raise ValueError(f"County source returned HTTP {response.status_code}.")
         buf = BytesIO()
