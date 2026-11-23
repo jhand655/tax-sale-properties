@@ -12,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from market_library import PAGE, fetch_listing
+from market_library import SPARTANBURG, fetch_listing
 
 import folium
 import pandas as pd
@@ -1928,15 +1928,18 @@ def market_workspace(manual_name, tax_df):
         county_candidate.clear()
     candidate, error, checked = county_candidate()
     st.caption(f"Last checked at {checked}")
-    st.link_button("County sale list page", PAGE)
+    st.link_button("County sale list page", SPARTANBURG["page"])
     if error:
         st.warning(f"County update check unavailable. {error}")
     if candidate:
-        st.link_button("View published county document", candidate["url"])
+        st.link_button("Real estate list", candidate["url"])
+        if candidate.get("mobile", {}).get("url"):
+            st.link_button("Mobile-home list", candidate["mobile"]["url"])
     manual = None
     if manual_name:
         manual = {"name": manual_name, "rows": tax_df.fillna("").astype(str).to_dict("records")}
-    result = market_card(key="spartanburg_market", data={
+    result = market_card(key=f"{SPARTANBURG['key']}_market", data={
+        "market": {"key": SPARTANBURG["key"], "name": SPARTANBURG["name"]},
         "manual": manual, "baseline": historical_market(), "candidate": candidate,
     }, on_selection_change=lambda: None)
     selection = result.selection
@@ -1966,7 +1969,8 @@ def main() -> None:
                 uploaded = io.BytesIO(pd.DataFrame(active["rows"]).to_csv(index=False).encode())
                 uploaded.name = f"Spartanburg {active['year']} real estate.csv"
                 uploaded.county_list = True
-            st.caption(uploaded.name if uploaded else "Historical 2024 sale list")
+                uploaded.display_name = f"Spartanburg {active['year']} · Real estate and mobile homes" if active.get("includeMobile") else uploaded.name
+            st.caption(getattr(uploaded, "display_name", uploaded.name) if uploaded else "Historical 2024 sale list")
             refresh = st.button("Refresh county data")
             st.caption("Investor UI development · v6.3")
 
@@ -1979,10 +1983,12 @@ def main() -> None:
     map_tab, bid_tab, history_tab, markets_tab = st.tabs(["Property map", "My bid list", "Tax history", "My Markets"], key="deal_page", on_change="rerun")
     with markets_tab:
         market_workspace(manual.name if manual else None, tax_df)
+    mobile = tax_df.get("Sale list", pd.Series("", index=tax_df.index)).eq("Mobile homes").fillna(False)
     with bid_tab:
         st.caption("Saved in this browser on this device. Total spent includes winning bids across your saved sale lists.")
+        addresses = tax_df["Property Address"].fillna("").where(~mobile, "Mobile home · " + tax_df["Property Address"].fillna(""))
         properties = [{"id": str(parcel), "address": str(address)}
-                      for parcel, address in zip(tax_df["Tax Map Number"], tax_df["Property Address"].fillna(""))]
+                      for parcel, address in zip(tax_df["Tax Map Number"], addresses)]
         data = {"sale": uploaded.name if uploaded else "Historical 2024", "properties": properties,
                 "pending": st.session_state.pop("bid_to_add", None)}
         template = Path(__file__).with_name("bid_list.html").read_text(encoding="utf-8")
@@ -1991,14 +1997,22 @@ def main() -> None:
     with history_tab:
         history = tax_history_workspace(tax_df)
     with map_tab:
-        render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, history)
+        if mobile.any():
+            homes = tax_df.loc[mobile]
+            with st.expander(f"Mobile homes · {len(homes):,} listings"):
+                st.caption("The county lists each home under its combined map and mobile-home number. Use that number in My bid list. The map below shows real estate.")
+                st.dataframe(homes[["Item Number", "Tax Map Number", "Owner Name", "Property Address", "Bid Amount"]],
+                             hide_index=True, width="stretch")
+        land = tax_df.loc[~mobile]
+        if not land.empty or not mobile.any():
+            render_property_map(land, uploaded, refresh, filter_panel, count_slot, history)
 
 
 def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, history):
     if uploaded is None:
         st.warning("Historical 2024 sale list — these properties are not presented as a current sale. Upload a current list to evaluate another sale.")
     else:
-        st.caption(f"Sale source: {uploaded.name}. Confirm its sale year and current availability.")
+        st.caption(f"Sale source: {getattr(uploaded, 'display_name', uploaded.name)}. Confirm its sale year and current availability.")
     review_rows = tax_df.attrs.get("review_rows", pd.DataFrame())
     if not review_rows.empty:
         st.warning(f"{len(review_rows)} source rows need review and were excluded from mapping.")
