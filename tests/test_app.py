@@ -205,3 +205,34 @@ def test_separate_mobile_home_list_is_optional_and_preserves_unit_ids(monkeypatc
     assert listing["rows"] and "error" in listing["mobile"]
     market = dict(library.SPARTANBURG, lists={"Real estate": "real estate sales tax list"})
     assert "mobile" not in library.fetch_listing(market)
+
+
+def test_market_check_manual_and_automatic(monkeypatch):
+    now = [0]
+    monkeypatch.setattr(app, "monotonic", lambda: now[0])
+    fetch = Mock(side_effect=[({"rows": []}, None, "initial"),
+                              (None, "timeout", "manual"),
+                              ({"rows": [1]}, None, "retry")])
+    monkeypatch.setattr(app, "county_candidate", fetch)
+    state = {}
+    assert app.market_check(state, False)["checked"] == "initial"
+    now[0] = 3
+    assert app.market_check(state, False)["checked"] == "initial"
+    assert app.market_check(state, True)["error"] == "timeout"
+    now[0] = 903
+    result = app.market_check(state, False)
+    assert result["candidate"]["rows"] == [1] and result["mode"] == "Automatic"
+    assert fetch.call_count == 3
+
+
+def test_check_county_button_retries_immediately(monkeypatch):
+    successful = {"year": "2026", "url": "https://example.com/list", "rows": []}
+    fetch = Mock(side_effect=[(None, "County timeout", "first"), (successful, None, "second")])
+    monkeypatch.setattr(app, "county_candidate", fetch)
+    monkeypatch.setattr(app, "fetch_parcels", lambda _: {"features": []})
+    test = AppTest.from_function(launch).run(timeout=20)
+    assert any("County timeout" in message.value for message in test.error)
+    next(button for button in test.button if button.label == "Check county now").click().run()
+    assert not test.exception
+    assert any("Manual check · second" in message.value for message in test.success)
+    assert fetch.call_count == 2
