@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from market_library import SPARTANBURG, fetch_listing
+from market_library import SPARTANBURG, fetch_listing, read_list
 
 import folium
 import pandas as pd
@@ -1903,7 +1903,7 @@ def county_candidate():
         candidate, error = fetch_listing(), None
     except Exception as exc:
         candidate, error = None, str(exc)
-    checked = datetime.now(ZoneInfo("America/New_York")).strftime("%b %d, %I:%M:%S %p %Z")
+    checked = datetime.now(ZoneInfo("America/New_York")).strftime("%B %d, %Y at %I:%M:%S %p %Z")
     return candidate, error, checked
 
 
@@ -1934,6 +1934,46 @@ market_card = st.components.v2.component(
 )
 
 
+@st.cache_data(max_entries=4, show_spinner="Reading county PDF…")
+def read_uploaded_county_pdf(content, kind):
+    if len(content) > 24 * 1024 * 1024:
+        raise ValueError("Choose a county PDF smaller than 24 MB.")
+    rows = read_list(content, upload_kind=kind)
+    if kind == "Mobile homes":
+        for row in rows:
+            row["Sale list"] = kind
+    return rows
+
+
+def county_pdf_fallback(candidate):
+    with st.expander("Use a downloaded county PDF", expanded=True):
+        st.caption("Open the county sale list page, download the published PDF, and upload it here to preview changes.")
+        if candidate is None:
+            year = st.number_input("County PDF sale year", min_value=2000, max_value=2100,
+                                   value=datetime.now(ZoneInfo("America/New_York")).year)
+            land = st.file_uploader("Real estate PDF", type="pdf", key="county_land_pdf")
+        else:
+            land = None
+        homes = st.file_uploader("Mobile-home PDF (optional)", type="pdf", key="county_home_pdf")
+        try:
+            if candidate is None:
+                if land is None:
+                    return None
+                candidate = {"year": str(year), "rows": read_uploaded_county_pdf(land.getvalue(), "Real estate"),
+                             "mobile": {"error": "Upload the mobile-home PDF to include those listings."}}
+            if homes is not None:
+                rows = read_uploaded_county_pdf(homes.getvalue(), "Mobile homes")
+                if {r["Tax Map Number"] for r in rows}.intersection(r["Tax Map Number"] for r in candidate["rows"]):
+                    raise ValueError("The two lists contain overlapping sale identifiers.")
+                candidate = {**candidate, "mobile": {"rows": rows}}
+        except Exception as exc:
+            st.warning(f"PDF could not be used. {exc}")
+            return None
+        if land or homes:
+            st.caption("Preview includes the PDF you supplied. Choose Replace current list to apply it.")
+        return candidate
+
+
 @st.fragment(run_every="1m")
 def market_workspace(manual_name, tax_df):
     st.subheader("My Markets")
@@ -1941,6 +1981,7 @@ def market_workspace(manual_name, tax_df):
     result = market_check(st.session_state, st.button("Check county now"))
     candidate, error = result["candidate"], result["error"]
     status = f"{result['mode']} check · {result['checked']}"
+    st.caption(f"Last checked: {result['checked']} (Eastern time)")
     if candidate:
         totals = [f"{len(candidate['rows']):,} real estate listings"]
         mobile = candidate.get("mobile", {})
@@ -1956,6 +1997,8 @@ def market_workspace(manual_name, tax_df):
         st.link_button("Real estate list", candidate["url"])
         if candidate.get("mobile", {}).get("url"):
             st.link_button("Mobile-home list", candidate["mobile"]["url"])
+    if "HTTP 403" in str(error) or "HTTP 403" in str((candidate or {}).get("mobile", {}).get("error", "")):
+        candidate = county_pdf_fallback(candidate)
     manual = None
     if manual_name:
         manual = {"name": manual_name, "rows": tax_df.fillna("").astype(str).to_dict("records")}
