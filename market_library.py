@@ -57,6 +57,9 @@ def download(url, source_page):
     if urlparse(url).scheme != "https" or urlparse(url).hostname != urlparse(source_page).hostname:
         raise ValueError("County source address has changed.")
     with requests.get(url, headers={"Cache-Control": "no-cache"}, timeout=(5, 20), stream=True, allow_redirects=False) as response:
+        if response.status_code == 403:
+            location = "sale page" if url == source_page else "sale document"
+            raise ValueError(f"The county denied this app access to its {location} (HTTP 403).")
         if response.status_code != 200:
             raise ValueError(f"County source returned HTTP {response.status_code}.")
         buf = BytesIO()
@@ -67,7 +70,7 @@ def download(url, source_page):
         return buf.getvalue()
 
 
-def read_list(pdf):
+def read_list(pdf, *, upload_kind=None):
     rows = []
     seen = set()
     with pdfplumber.open(BytesIO(pdf)) as doc:
@@ -75,7 +78,10 @@ def read_list(pdf):
             table = page.extract_table()
             if not table or len(table) < 2:
                 raise ValueError(f"Unrecognized table on page {number}.")
-            columns = [HEADINGS.get(" ".join((s or "").lower().split())) for s in table[0]]
+            headings = [" ".join((s or "").lower().split()) for s in table[0]]
+            if upload_kind and ("map+mh#" in headings) != (upload_kind == "Mobile homes"):
+                raise ValueError(f"The headings on page {number} do not match the {upload_kind.lower()} list.")
+            columns = [HEADINGS.get(s) for s in headings]
             if None in columns or len(set(columns)) != len(columns) or not REQUIRED <= set(columns):
                 raise ValueError(f"Unrecognized columns on page {number}.")
             for cells in table[1:]:
