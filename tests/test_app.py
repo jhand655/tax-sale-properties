@@ -138,7 +138,7 @@ def test_streamlit_single_bid_and_quick_toggle(monkeypatch):
     monkeypatch.setattr(app,'fetch_parcels',lambda _: {'features':[feature(PropertyType='RES')],'fetched_at':'2026-11-17T00:00:00Z'})
     test=AppTest.from_function(launch).run(timeout=20)
     assert not test.exception
-    assert any('2024' in w.value for w in test.warning)
+    assert any("2026 county list" in c.value for c in test.caption)
     test.radio[0].set_value('Commercial').run()
     assert not test.exception
     assert any('No parcels match' in w.value for w in test.warning)
@@ -254,3 +254,16 @@ def test_forbidden_check_shows_eastern_date_and_pdf_recovery(monkeypatch):
                for c in test.caption if "Last checked" in c.value)
     assert any("HTTP 403" in e.value for e in test.error)
     assert any(u.label == "Real estate PDF" for u in test.get("file_uploader"))
+
+def test_bundled_county_list_loads_with_403_and_archive_is_optional(monkeypatch):
+    monkeypatch.setattr(app, "county_candidate", lambda: (None, "HTTP 403", "now"))
+    monkeypatch.setattr(app, "fetch_parcels", lambda _: {"features": []})
+    test = AppTest.from_function(launch).run(timeout=20)
+    assert not test.exception
+    snapshot = app.bundled_market()
+    assert len(snapshot["rows"]) == 1275 and len(snapshot["mobile"]["rows"]) == 271
+    assert any("2026 county list" in c.value for c in test.caption)
+    archive = next(c for c in test.checkbox if c.label == "View historical 2024 list")
+    archive.check().run()
+    assert not test.exception
+    assert any("Historical 2024 sale list" in w.value for w in test.warning)
