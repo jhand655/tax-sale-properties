@@ -133,6 +133,7 @@ def launch():
 
 
 def test_streamlit_single_bid_and_quick_toggle(monkeypatch):
+    monkeypatch.setattr(app, "county_candidate", lambda: (None, "Offline", "12:00 UTC"))
     monkeypatch.setattr(app,'load_tax_sale_file',lambda _:sale_df.copy())
     monkeypatch.setattr(app,'fetch_parcels',lambda _: {'features':[feature(PropertyType='RES')],'fetched_at':'2026-11-17T00:00:00Z'})
     test=AppTest.from_function(launch).run(timeout=20)
@@ -144,6 +145,7 @@ def test_streamlit_single_bid_and_quick_toggle(monkeypatch):
 
 
 def test_streamlit_empty_sale_stops_before_network(monkeypatch):
+    monkeypatch.setattr(app, "county_candidate", lambda: (None, "Offline", "12:00 UTC"))
     empty=sale_df.iloc[:0].copy()
     monkeypatch.setattr(app,'load_tax_sale_file',lambda _:empty)
     def fail(_):raise AssertionError('County should not be queried')
@@ -161,3 +163,24 @@ def test_partial_appraisal_is_not_reported_as_total():
     assert g['features'][0]['properties']['AppraisedTotal'] is None
     g,_=app.merge_tax_data({'features':[feature(CurrentAppraisedLandValue=5000,CurrentAppraisedBuildingValue=0)]},sale())
     assert g['features'][0]['properties']['AppraisedTotal']==5000
+
+
+def test_unpublished_county_bids_are_mappable(monkeypatch):
+    listing = {"year": "2026", "url": "https://example.com/list", "rows": [{
+        "Item Number": "1", "Tax Map Number": "001", "Owner Name": "A",
+        "Property Address": "Main St", "Bid Amount": "",
+    }]}
+    monkeypatch.setattr(app, "county_candidate", lambda: (listing, None, "12:00 UTC"))
+    monkeypatch.setattr(app, "fetch_parcels", lambda _: {"features": [feature(PropertyType="RES")]})
+    test = AppTest.from_function(launch)
+    test.session_state.active_market_list = listing
+    test.run(timeout=20)
+    assert not test.exception
+    assert any("Opening bids have not been published" in c.value for c in test.caption)
+    source = csv_file([[1, "001", "A", "Main St", ""]])
+    source.county_list = True
+    frame = app.load_tax_sale_file(source)
+    merged, missing = app.merge_tax_data({"features": [feature()]}, frame)
+    assert not missing
+    assert merged["features"][0]["properties"]["BidAmount"] is None
+    assert merged["features"][0]["properties"]["MaxReturnBid"] is None
