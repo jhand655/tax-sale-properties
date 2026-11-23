@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import os
+import io
 import json
 import math
 import re
@@ -1166,6 +1167,9 @@ def popup_html(props: dict[str, Any], review=None) -> str:
         "Investor UI v6.3-dev"
         "</div>"
         + tax_sale_html
+        + section_header("TAX HISTORY")
+        + row("Yearly status", props.get("Tax history", "No history entered"))
+        + (row("Distress indicator", props["Distress indicator"]) if "Distress indicator" in props else "")
         + f"<button type='button' class='add-bid-property' data-parcel='{esc(props.get('TaxMapNumber'))}'>Add to bid list</button>"
 
         + lien_review_html
@@ -1814,6 +1818,74 @@ def reset_property_filters():
             del st.session_state[key]
 
 
+HISTORY_COLUMNS = ["Tax Map Number", "Tax Year", "Status"]
+TAX_STATUSES = ["Outstanding delinquent", "Paid after delinquency", "Paid", "Unknown"]
+TAX_FILTERS = ["All histories", "2+ outstanding years", "3+ outstanding years",
+               "Repeated delinquency (any years)", "Consecutive delinquent years"]
+
+
+def summarize_tax_history(rows):
+    records = {}
+    for parcel, year, status in rows[HISTORY_COLUMNS].itertuples(index=False, name=None):
+        if all(pd.isna(value) or not str(value).strip() for value in (parcel, year, status)):
+            continue
+        parcel = normalize_tax_map(parcel)
+        year_text = str(year).strip()
+        status = str(status).strip()
+        if not parcel or not re.fullmatch(r"(19|20)\d{2}", year_text) or status not in TAX_STATUSES:
+            raise ValueError("Each row needs a parcel ID, four-digit tax year and a listed status.")
+        year = int(year_text)
+        years = records.setdefault(parcel, {})
+        if year in years and years[year] != status:
+            raise ValueError(f"Conflicting statuses for {parcel} in {year}. Reconcile that year before applying.")
+        years[year] = status
+
+    result = {}
+    for parcel, years in records.items():
+        delinquent = {year for year, status in years.items() if status in TAX_STATUSES[:2]}
+        outstanding = sum(status == TAX_STATUSES[0] for status in years.values())
+        result[parcel] = {
+            "Tax history": " · ".join(f"{year}: {years[year]}" for year in sorted(years, reverse=True)),
+            "Outstanding years": outstanding, "Delinquent years": len(delinquent),
+            "Consecutive delinquency": any(year - 1 in delinquent for year in delinquent),
+            "Distress indicator": ("3+ outstanding · deeper review" if outstanding >= 3 else
+                                   "2 outstanding · moderate" if outstanding == 2 else
+                                   "1 outstanding" if outstanding else "No confirmed outstanding years"),
+        }
+    return result
+
+
+def tax_history_workspace(tax_df):
+    st.subheader("Tax delinquency history")
+    st.caption("Record one row per parcel and tax year. Use Paid after delinquency only when late payment is documented. Missing years are unknown. Counts reflect the records you enter.")
+    st.link_button("Check Spartanburg County tax records", "https://spartanburgcountytax.qpaybill.com/")
+    uploaded = st.file_uploader("Import tax history (CSV)", type="csv", key="tax_history_csv")
+    scope = "manual" if uploaded is None else uploaded.file_id
+    try:
+        rows = (pd.read_csv(io.BytesIO(uploaded.getvalue()), dtype=str, keep_default_na=False)
+                if uploaded else pd.DataFrame(columns=HISTORY_COLUMNS, dtype=str))
+        if not set(HISTORY_COLUMNS).issubset(rows.columns):
+            raise ValueError("Required headings: " + ", ".join(HISTORY_COLUMNS))
+        edited = st.data_editor(rows[HISTORY_COLUMNS], num_rows="dynamic", hide_index=True,
+                                column_config={"Status": st.column_config.SelectboxColumn(options=TAX_STATUSES),
+                                               "Tax Year": st.column_config.TextColumn(),
+                                               "Tax Map Number": st.column_config.TextColumn()},
+                                key=f"tax_history_rows_{scope}", width="stretch")
+        st.download_button("Download history CSV", edited.to_csv(index=False), "parcel_tax_history.csv", "text/csv")
+        st.caption("Download your edits to keep them between sessions. Import the CSV to resume.")
+        history = summarize_tax_history(edited)
+    except (ValueError, UnicodeError) as exc:
+        st.error(f"Tax history could not be applied. {exc}")
+        return {}
+    matched = set(history).intersection(tax_df["Tax Map Number"])
+    if history:
+        st.caption(f"{len(matched)} of {len(history)} history parcels match the loaded sale list.")
+        if matched:
+            st.dataframe([{"Tax Map Number": parcel, **history[parcel]} for parcel in sorted(matched)],
+                         hide_index=True, width="stretch")
+    return history
+
+
 def main() -> None:
     configure_page()
     render_hero()
@@ -1834,7 +1906,7 @@ def main() -> None:
         st.error(f"The tax-sale file could not be loaded: {exc}")
         st.stop()
 
-    map_tab, bid_tab = st.tabs(["Property map", "My bid list"], key="deal_page", on_change="rerun")
+    map_tab, bid_tab, history_tab = st.tabs(["Property map", "My bid list", "Tax history"], key="deal_page", on_change="rerun")
     with bid_tab:
         st.caption("Saved in this browser on this device. Total spent includes winning bids across your saved sale lists.")
         properties = [{"id": str(parcel), "address": str(address)}
@@ -1844,11 +1916,13 @@ def main() -> None:
         template = Path(__file__).with_name("bid_list.html").read_text(encoding="utf-8")
         st.iframe(template.replace("__BID_DATA__", json.dumps(data).replace("<", r"\u003c")), height=660,
                   alt="Bid list, notes and total spent")
+    with history_tab:
+        history = tax_history_workspace(tax_df)
     with map_tab:
-        render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot)
+        render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, history)
 
 
-def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot):
+def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, history):
     if uploaded is None:
         st.warning("Historical 2024 sale list — these properties are not presented as a current sale. Upload a current list to evaluate another sale.")
     else:
@@ -1878,6 +1952,10 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot):
             st.code(str(exc))
             st.caption(f"Parcel service: {PARCEL_LAYER_URL}")
             st.stop()
+
+    for feature in merged_geojson["features"]:
+        props = feature["properties"]
+        props.update(history.get(props["TaxMapNumber"], {}))
 
     try:
         lien_reviews = load_lien_reviews()
@@ -2032,6 +2110,7 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot):
                 "building data remain visible until you narrow a related filter."
             )
 
+        tax_filter = st.selectbox("Tax delinquency", TAX_FILTERS, key="filter_tax_history")
         st.button("Reset filters", on_click=reset_property_filters)
 
     filtered_geojson = filter_geojson(
@@ -2047,6 +2126,14 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot):
         living_area_range=living_area_filter,
         year_built_range=year_built_filter,
     )
+    if tax_filter != TAX_FILTERS[0]:
+        tests = {
+            TAX_FILTERS[1]: lambda p: p.get("Outstanding years", 0) >= 2,
+            TAX_FILTERS[2]: lambda p: p.get("Outstanding years", 0) >= 3,
+            TAX_FILTERS[3]: lambda p: p.get("Delinquent years", 0) >= 2,
+            TAX_FILTERS[4]: lambda p: p.get("Consecutive delinquency", False),
+        }
+        filtered_geojson["features"] = [f for f in filtered_geojson["features"] if tests[tax_filter](f["properties"])]
     visible_count = parcel_count(filtered_geojson)
     count_slot.markdown(f"**{visible_count:,}** of {matched_count:,} mapped parcels")
 
@@ -2198,6 +2285,7 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot):
                     "Owner Name": props.get("SaleOwnerName"),
                     "Property Address": props.get("SalePropertyAddress"),
                     "Property Class": props.get("PropertyClass"),
+                    **{field: props.get(field) for field in ("Tax history", "Outstanding years", "Delinquent years", "Consecutive delinquency", "Distress indicator")},
                     "Lien Review": get_lien_review(lien_reviews, str(props.get("TaxMapNumber", "")))["stage"],
                     "Bid Amount": props.get("BidAmount"),
                     "Max Return Bid": props.get("MaxReturnBid"),
