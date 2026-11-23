@@ -1981,10 +1981,26 @@ def county_pdf_fallback(candidate):
 
 
 @st.fragment(run_every="1m")
-def market_workspace(manual_name, tax_df):
+def market_workspace(manual_name, tax_df, loaded_label):
     st.subheader("My Markets")
     st.caption("Checks the county every 15 minutes while the app is open. Your selected list is saved in this browser.")
-    result = market_check(st.session_state, st.button("Check county now"))
+    st.markdown(f"**Loaded sale list** · {loaded_label} · {len(tax_df):,} listings")
+    with st.expander("View loaded listings"):
+        rows = tax_df[["Item Number", "Tax Map Number", "Owner Name", "Property Address", "Bid Amount"]]
+        rows.attrs = {}
+        st.dataframe(rows, hide_index=True, width="stretch", height=300)
+    def request_check():
+        st.session_state.county_check_requested = True
+
+    st.button("Check county now", key="check_market_now", on_click=request_check)
+    manual_check = st.session_state.get("county_check_requested", False)
+    if manual_check:
+        progress = st.empty()
+        progress.info("Contacting Spartanburg County for the latest lists…")
+    result = market_check(st.session_state, manual_check)
+    if manual_check:
+        st.session_state.county_check_requested = False
+        progress.empty()
     candidate, error = result["candidate"], result["error"]
     status = f"{result['mode']} check · {result['checked']}"
     st.caption(f"Last checked: {result['checked']} (Eastern time)")
@@ -2058,7 +2074,9 @@ def main() -> None:
 
     map_tab, bid_tab, history_tab, markets_tab = st.tabs(["Property map", "My bid list", "Tax history", "My Markets"], key="deal_page", on_change="rerun")
     with markets_tab:
-        market_workspace(manual.name if manual else ("Historical 2024" if archive else None), tax_df)
+        override = manual.name if manual else ("Historical 2024" if archive else None)
+        loaded_label = override or active.get("name") or f"Spartanburg {active['year']} county list"
+        market_workspace(override, tax_df, loaded_label)
     mobile = tax_df.get("Sale list", pd.Series("", index=tax_df.index)).eq("Mobile homes").fillna(False)
     with bid_tab:
         st.caption("Saved in this browser on this device. Total spent includes winning bids across your saved sale lists.")
