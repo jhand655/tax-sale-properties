@@ -1166,6 +1166,8 @@ def popup_html(props: dict[str, Any], review=None) -> str:
         "Investor UI v6.3-dev"
         "</div>"
         + tax_sale_html
+        + f"<button type='button' class='add-bid-property' data-parcel='{esc(props.get('TaxMapNumber'))}'>Add to bid list</button>"
+
         + lien_review_html
         + (
             "<button type='button' class='lien-review' style='padding:8px 14px;cursor:pointer' "
@@ -1270,6 +1272,11 @@ class LienReview(MacroElement):
     _template = Template("""
     {% macro script(this, kwargs) %}
     {{ this._parent.get_name() }}.on("popupopen", function(event) {
+        const add = event.popup.getElement().querySelector(".add-bid-property");
+        if (add) add.onclick = () => window.parent.postMessage({
+            isStreamlitMessage: true, type: "streamlit:setComponentValue",
+            dataType: "json", value: {bidParcel: add.dataset.parcel}
+        }, "*");
         const open = event.popup.getElement().querySelector(".open-title-review");
         if (open) open.onclick = () => window.parent.postMessage({
             isStreamlitMessage: true, type: "streamlit:setComponentValue",
@@ -1827,6 +1834,21 @@ def main() -> None:
         st.error(f"The tax-sale file could not be loaded: {exc}")
         st.stop()
 
+    map_tab, bid_tab = st.tabs(["Property map", "My bid list"], key="deal_page", on_change="rerun")
+    with bid_tab:
+        st.caption("Saved in this browser on this device. Total spent includes winning bids across your saved sale lists.")
+        properties = [{"id": str(parcel), "address": str(address)}
+                      for parcel, address in zip(tax_df["Tax Map Number"], tax_df["Property Address"].fillna(""))]
+        data = {"sale": uploaded.name if uploaded else "Historical 2024", "properties": properties,
+                "pending": st.session_state.pop("bid_to_add", None)}
+        template = Path(__file__).with_name("bid_list.html").read_text(encoding="utf-8")
+        st.iframe(template.replace("__BID_DATA__", json.dumps(data).replace("<", r"\u003c")), height=660,
+                  alt="Bid list, notes and total spent")
+    with map_tab:
+        render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot)
+
+
+def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot):
     if uploaded is None:
         st.warning("Historical 2024 sale list — these properties are not presented as a current sale. Upload a current list to evaluate another sale.")
     else:
@@ -2105,7 +2127,11 @@ def main() -> None:
         map_object = build_map(filtered_geojson, lien_reviews)
 
         def open_map_review():
-            selected = (st.session_state.get("opportunity_map") or {}).get("reviewParcel")
+            action = st.session_state.get("opportunity_map") or {}
+            if action.get("bidParcel") in review_ids:
+                st.session_state["bid_to_add"] = action["bidParcel"]
+                st.session_state["deal_page"] = "My bid list"
+            selected = action.get("reviewParcel")
             if selected in review_ids:
                 st.session_state["review_selection"] = selected
 
