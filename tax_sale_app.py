@@ -4,6 +4,7 @@ import html
 import os
 import io
 import json
+from statistics import median
 import math
 import re
 import threading
@@ -25,6 +26,7 @@ import streamlit as st
 from branca.element import MacroElement, Template
 from requests.adapters import HTTPAdapter
 from streamlit_folium import st_folium
+from urllib3.exceptions import HTTPError as TransportError
 from urllib3.util.retry import Retry
 
 APP_TITLE = "Spartanburg Tax Sale Deal Finder"
@@ -1195,6 +1197,10 @@ def popup_html(props: dict[str, Any], review=None) -> str:
         )
         + property_summary
         + county_values_html
+        + section_header("MARKET VALUE · CLOSED SALES")
+        + row("Market estimate", value_or_dash(props.get("SoldCompEstimate"), format_currency), strong=True)
+        + row("Comparable sales", props.get("SoldCompCount", "—"))
+        + "<small>See Value &amp; Comps for sale prices and dates.</small>"
         + (
             f"<div style='margin-top:10px;font-size:11px'>"
             f"<a href='{PARCEL_LAYER_URL}' target='_blank' rel='noopener noreferrer'>"
@@ -1954,6 +1960,79 @@ def render_lien_review_workspace(
     return reviews
 
 
+SOLD_DATA_PAGE = "https://realestatedataset.com/south-carolina/spartanburg-county"
+SOLD_DATA_URL = "https://realestatedataset.com/data/latest/county=45083.csv"
+SOLD_TYPES = {"single_family", "manufactured", "townhouse", "condo", "multi_family", "land"}
+
+
+def comp_apn(value):
+    # Spartanburg formats the same ten digits with or without punctuation.
+    value = re.sub(r"[-.\s]", "", str(value))
+    return value if re.fullmatch(r"[0-9]{10}", value) else ""
+
+
+@st.cache_resource(ttl=86400, max_entries=1, show_spinner=False)
+def sold_catalog(as_of):
+    columns = ["parcel_apn", "county_fips", "street", "unit", "city", "lat", "lng",
+               "property_type", "sqft", "lot_sqft", "beds", "year_built", "last_sold_price", "last_sold_date"]
+    with requests.get(SOLD_DATA_URL, stream=True, timeout=(5, 35)) as response:
+        response.raise_for_status()
+        response.raw.decode_content = True
+        frame = pd.read_csv(response.raw, usecols=columns, dtype={"parcel_apn": "string", "county_fips": "string", "unit": "string"})
+    frame = frame.loc[frame.county_fips.eq("45083")].copy()
+    if frame.empty:
+        raise ValueError("The sales feed returned no Spartanburg County records.")
+    frame["parcel_apn"] = frame.parcel_apn.map(comp_apn)
+    frame = frame.loc[frame.parcel_apn.ne("") & ~frame.parcel_apn.duplicated(keep=False)
+                      & frame.property_type.isin(SOLD_TYPES)].copy()
+    for field in ("lat", "lng", "sqft", "lot_sqft", "beds", "year_built", "last_sold_price"):
+        frame[field] = pd.to_numeric(frame[field], errors="coerce")
+    frame["size"] = frame.sqft.where(frame.property_type.ne("land"), frame.lot_sqft)
+    frame = frame.loc[frame["size"].gt(0) & frame.lat.between(34, 36) & frame.lng.between(-83, -81)]
+    frame["last_sold_date"] = pd.to_datetime(frame.last_sold_date, errors="coerce")
+    latest = frame.last_sold_date.where(frame.last_sold_date.le(pd.Timestamp(as_of))).max()
+    cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=365)
+    sales = frame.loc[frame.last_sold_date.between(cutoff, pd.Timestamp(as_of)) & frame.last_sold_price.ge(1000)
+                      & (frame.property_type.eq("land") | frame.year_built.isna()
+                         | frame.year_built.le(frame.last_sold_date.dt.year))]
+    cells = {}
+    for record in sales.itertuples(index=False):
+        cell = (record.property_type, math.floor(record.lat * 20), math.floor(record.lng * 20))
+        cells.setdefault(cell, []).append(record)
+    return frame.set_index("parcel_apn"), cells, latest
+
+
+def sold_comparison(parcel, catalog):
+    subjects, cells, _ = catalog
+    apn = comp_apn(parcel)
+    if apn not in subjects.index:
+        return None, [], "No unique parcel match with usable type, size and coordinates."
+    subject = subjects.loc[apn]
+    kind, size = subject.property_type, subject["size"]
+    x, y = math.floor(subject.lat * 20), math.floor(subject.lng * 20)
+    nearby = []
+    for i in range(x - 1, x + 2):
+        for j in range(y - 1, y + 2):
+            for comp in cells.get((kind, i, j), ()):
+                if comp.parcel_apn == apn or abs(comp.size / size - 1) > .25:
+                    continue
+                if pd.notna(subject.beds) and pd.notna(comp.beds) and abs(subject.beds - comp.beds) > 1:
+                    continue
+                miles = math.hypot((comp.lat - subject.lat) * 69.09,
+                                   (comp.lng - subject.lng) * 69.09 * math.cos(math.radians(subject.lat)))
+                if miles > 2:
+                    continue
+                nearby.append((miles, -comp.last_sold_date.value, comp.parcel_apn, comp))
+    rows = []
+    for miles, _, _, c in sorted(nearby)[:5]:
+        rows.append({"Parcel": c.parcel_apn, "Address": " ".join(str(v) for v in (c.street, c.unit, c.city) if pd.notna(v)),
+                     "Sold date": c.last_sold_date.date().isoformat(), "Sold price": c.last_sold_price,
+                     "Size (sq ft)": c.size, "$ / sq ft": c.last_sold_price / c.size, "Miles": round(miles, 2)})
+    estimate = round(size * median(row["$ / sq ft"] for row in rows)) if len(rows) >= 3 else None
+    basis = "lot area" if kind == "land" else "floor area"
+    return estimate, rows, f"{kind.replace('_', ' ')} · {size:,.0f} sq ft {basis}"
+
+
 def county_comps(props, center, radius, days):
     cutoff = datetime.now(timezone.utc).date() - timedelta(days=days)
     lat, lon = center
@@ -1986,19 +2065,31 @@ def county_comps(props, center, radius, days):
                and (b := numeric_value(p.get(field))) is not None):
             continue
         seen.add(parcel)
-        state_lien = review["checks"]["state_tax_lien"]
-        if state_lien in ("Possible Match", "Record Found"):
-            notify_findings(parcel, "state tax lien", [state_lien])
         rows.append({"Parcel": parcel, "Address": p.get("PropertyLocation"), "Price": p["SaleAmount"],
                      "Sq ft": size, "Date": format_arcgis_date(p["SaleDate"]), "Beds": p.get("BedRooms"),
                      "Full baths": p.get("FullBaths"), "Year built": p.get("YearBuilt"), "Acres": p.get("Acreage")})
     return rows
 
 
-def render_comps(feature):
+def render_comps(feature, sold_details=None, latest=None):
     props = feature["properties"]
     st.write(props.get("SalePropertyAddress") or props["TaxMapNumber"])
-    st.metric("County appraised value", format_currency(props.get("AppraisedTotal")))
+    county_metric, market_metric = st.columns(2)
+    county_metric.metric("County appraised value", format_currency(props.get("AppraisedTotal")))
+    estimate, evidence, basis = sold_details or (None, [], "Sold-property data unavailable for this parcel.")
+    market_metric.metric("Market estimate · closed sales", format_currency(estimate) if estimate is not None else "—")
+    st.caption(basis)
+    if evidence:
+        st.dataframe(evidence, hide_index=True, width="stretch", column_config={
+            "Sold price": st.column_config.NumberColumn(format="dollar"),
+            "$ / sq ft": st.column_config.NumberColumn(format="$%.2f")})
+    if estimate is None:
+        st.caption(f"{len(evidence)} qualifying sales. A market estimate requires at least three.")
+    st.caption("Uses the nearest five same-type sales within two miles and the past 365 days, with sizes within 25%. Median sold price per square foot × subject size. Land uses lot area. Sale terms and property condition require review.")
+    if pd.notna(latest):
+        st.caption(f"Latest sale date in the source data: {latest.date()}")
+    st.markdown(f"[View Spartanburg sold-property data]({SOLD_DATA_PAGE})")
+    st.markdown("#### Additional comp searches")
     if props.get("PropertyClass") != "Residential":
         st.info("Residential comps require a parcel classified as Residential.")
         return
@@ -2397,6 +2488,20 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
             st.caption(f"Parcel service: {PARCEL_LAYER_URL}")
             st.stop()
 
+    sold_details = {}
+    latest_sale = None
+    if any(comp_apn(f["properties"]["TaxMapNumber"]) for f in merged_geojson["features"]):
+        try:
+            catalog = sold_catalog(datetime.now(ZoneInfo("America/New_York")).date())
+            latest_sale = catalog[2]
+            for feature in merged_geojson["features"]:
+                props = feature["properties"]
+                parcel = props["TaxMapNumber"]
+                estimate, evidence, basis = sold_comparison(parcel, catalog)
+                sold_details[parcel] = estimate, evidence, basis
+                props.update({"SoldCompEstimate": estimate, "SoldCompCount": len(evidence)})
+        except (requests.RequestException, TransportError, OSError, ValueError) as exc:
+            st.warning(f"Closed-sale data unavailable. {exc}")
     for feature in merged_geojson["features"]:
         props = feature["properties"]
         props.update(history.get(props["TaxMapNumber"], {}))
@@ -2650,7 +2755,7 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
     with st.expander("Value & Comps"):
         comp_id = st.selectbox("Choose a parcel for comps", review_ids, index=None)
         if comp_id:
-            render_comps(find_feature_by_tax_map(merged_geojson, comp_id))
+            render_comps(find_feature_by_tax_map(merged_geojson, comp_id), sold_details.get(comp_id), latest_sale)
     selection = st.selectbox("Open lien review by tax map number", review_ids, index=None, key="review_selection")
     selected_review = selection or st.query_params.get("lien_review")
     if selected_review:
@@ -2749,6 +2854,8 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
                     "Basement": props.get("Basement"),
                     "Land Use": props.get("LandUse"),
                     "County Appraised Value": props.get("AppraisedTotal"),
+                    "Closed-sale estimate": props.get("SoldCompEstimate"),
+                    "Comparable sales": props.get("SoldCompCount"),
                 }
             )
 
@@ -2761,6 +2868,7 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
 
             table_columns = {
                 "Bid Amount": st.column_config.NumberColumn(format="$%.2f"),
+                "Closed-sale estimate": st.column_config.NumberColumn(format="$%.0f"),
                 "County Appraised Value": st.column_config.NumberColumn(format="$%.0f"),
                 "Living Area": st.column_config.NumberColumn(format="%.0f sq ft"),
                 "Acreage": st.column_config.NumberColumn(format="%.2f"),
