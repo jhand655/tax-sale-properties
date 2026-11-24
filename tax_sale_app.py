@@ -49,7 +49,7 @@ LEGACY_MAX_BID_COLUMN = "Max Bid"
 LIEN_REVIEW_FILE = Path(__file__).with_name("lien_reviews.json")
 ROD_SEARCH_URL = "https://search.spartanburgdeeds.com/"
 SCDOR_LIEN_URL = "https://dor.sc.gov/LienRegistry"
-SC_COURTS_URL = "https://www.spartanburgcounty.gov/706/Judgement-Statements"
+SC_COURTS_URL = "https://publicindex.sccourts.org/spartanburg/publicindex/"
 LIEN_REVIEW_STAGES = [
     "Not Reviewed",
     "Preliminary Review In Progress",
@@ -980,10 +980,14 @@ def review_write_lock():
 def save_lien_review(parcel, review):
     with review_write_lock():
         records = load_lien_reviews()
-        records[parcel] = review
-        temp = LIEN_REVIEW_FILE.with_suffix(".tmp")
-        temp.write_text(json.dumps(records, indent=2), encoding="utf-8")
-        temp.replace(LIEN_REVIEW_FILE)
+        records[parcel] = {**records.get(parcel, {}), **review}
+        write_lien_reviews(records)
+
+
+def write_lien_reviews(records):
+    temp = LIEN_REVIEW_FILE.with_suffix(".tmp")
+    temp.write_text(json.dumps(records, indent=2), encoding="utf-8")
+    temp.replace(LIEN_REVIEW_FILE)
 
 
 def default_lien_review(tax_map: str) -> dict[str, Any]:
@@ -1311,7 +1315,7 @@ class LienReview(MacroElement):
                   <label><input type="checkbox" name="deeds"> Mortgages, liens and releases</label>
                   <a href="https://search.spartanburgdeeds.com/" target="_blank" rel="noopener noreferrer">Deed records</a><br>
                   <label><input type="checkbox" name="court"> Judgments</label>
-                  <a href="https://www.spartanburgcounty.gov/706/Judgement-Statements" target="_blank" rel="noopener noreferrer">County court index guidance</a><br>
+                  <a href="https://publicindex.sccourts.org/spartanburg/publicindex/" target="_blank" rel="noopener noreferrer">County court index guidance</a><br>
                   <label><input type="checkbox" name="tax"> State tax liens</label>
                   <a href="https://dor.sc.gov/LienRegistry" target="_blank" rel="noopener noreferrer">State registry</a>
                 </fieldset>
@@ -1558,9 +1562,158 @@ def recorder_matches(last, first):
     return search_documents(last, first)
 
 
+def notify_findings(parcel, source, identifiers):
+    seen = st.session_state.setdefault("notified_title_records", set())
+    keys = {(parcel, source, identifier) for identifier in identifiers}
+    new = keys - seen
+    if new:
+        st.toast(f"{parcel} · {len(new)} new {source} finding(s) for review", icon="🔔")
+        seen.update(new)
+
+
+def judgment_numbers(text):
+    lines = text.strip().splitlines()
+    if not lines:
+        return []
+    numbers = lines
+    if "\t" in lines[0]:
+        headers = [field.strip().lower() for field in lines[0].split("\t")]
+        column = next((idx for idx, field in enumerate(headers)
+                       if field in {"judgment #", "judgment number", "judgment#"}), None)
+        if column is None or "name" not in headers:
+            raise ValueError("Include the Public Index table header with Name and Judgment #.")
+        numbers = []
+        for line in lines[1:]:
+            cells = line.split("\t")
+            if len(cells) <= column:
+                raise ValueError("Incomplete result row. Copy the full table or enter judgment numbers.")
+            if cells[column].strip():
+                numbers.append(cells[column])
+    refs = list(dict.fromkeys(value.strip().upper() for value in numbers if value.strip()))
+    if any(not re.fullmatch(r"(?=[A-Z0-9 /-]*[0-9])[A-Z0-9][A-Z0-9 /-]{0,63}", ref) for ref in refs):
+        raise ValueError("Enter one judgment number per line or copy the results with their headers.")
+    return refs
+
+
+def court_lookup(parcel, owner, key):
+    with st.expander("Judgments · Spartanburg Public Index"):
+        st.code(owner or "Owner unavailable")
+        st.link_button("Search Spartanburg Public Index", SC_COURTS_URL, key=key + "_court")
+        st.caption("Search each owner under Civil Cases → Judgments → Judgment Against. Verify the party and check the Judgments tab for satisfaction.")
+        with st.form(key + "_judgment"):
+            reference = st.text_area("Paste Judgment Against results for this owner, including the table header, or enter one judgment number per line")
+            saved = st.form_submit_button("Flag results for this owner")
+        if saved:
+            try:
+                numbers = judgment_numbers(reference)
+            except ValueError as exc:
+                st.error(str(exc))
+                numbers = []
+            if not numbers:
+                st.info("No judgment numbers imported.")
+            else:
+                try:
+                    with review_write_lock():
+                        reviews = load_lien_reviews()
+                        review = get_lien_review(reviews, parcel)
+                        refs = review.setdefault("court_references", [])
+                        if any(number not in refs for number in numbers):
+                            refs.extend(number for number in numbers if number not in refs)
+                            review["checks"]["judgment"] = "Possible Match"
+                            review["updated_at"] = datetime.now(timezone.utc).isoformat()
+                            reviews[parcel] = review
+                            write_lien_reviews(reviews)
+                    st.session_state.pop(f"lien_check_{parcel}_judgment", None)
+                    st.rerun()
+                except (ValueError, OSError) as exc:
+                    st.error(f"Could not save judgment: {exc}")
+        try:
+            review = get_lien_review(load_lien_reviews(), parcel)
+        except (ValueError, OSError):
+            st.warning("Saved judgment checks are unavailable.")
+            return
+        if review["checks"]["judgment"] in ("Possible Match", "Record Found"):
+            refs = review.get("court_references") or ["See parcel review"]
+            notify_findings(parcel, "judgment", refs)
+            st.warning("Saved judgment finding · " + ", ".join(refs))
+
+
+bid_watch = st.components.v2.component(
+    "bid_watch", html="<span></span>",
+    js="""export default function({parentElement, data, setStateValue}) {
+      const root = parentElement.querySelector("span");
+      function sync() {
+        try {
+          const ids = [];
+          for (const key of Object.keys(localStorage)) {
+            if (!key.startsWith("spartanburg:bid-list:v1:")) continue;
+            const [sale, id] = JSON.parse(key.slice("spartanburg:bid-list:v1:".length));
+            if (sale === data.sale) ids.push(id);
+          }
+          const value = JSON.stringify(ids.sort());
+          if (root.dataset.sent !== value) {root.dataset.sent = value; setStateValue("ids", ids);}
+        } catch {root.textContent = "Browser bid storage unavailable for title checks.";}
+      }
+      sync(); window.addEventListener("storage", sync);
+      return () => window.removeEventListener("storage", sync);
+    }"""
+)
+
+
+@st.fragment(run_every="1m")
+def bid_record_alerts(sale, owners):
+    watch = bid_watch(data={"sale": sale}, key="bid_watch", on_ids_change=lambda: None)
+    parcels = [p for p in (watch.ids or []) if p in owners]
+    if not parcels:
+        return
+    st.markdown("#### Bid list title alerts")
+    st.caption("Checks one due parcel per minute while the app is open. Successful owner searches refresh hourly. Verify the indexed party, legal description and releases.")
+    scans = st.session_state.setdefault("bid_record_scans", {})
+    now = monotonic()
+    due = [(scans.get((p, owners[p]), {}).get("next", 0), p) for p in parcels if owners[p]]
+    if due and min(due)[0] <= now:
+        _, parcel = min(due)
+        owner = owners[parcel]
+        state = scans.setdefault((parcel, owner), {})
+        try:
+            docs = recorder_matches(*owner_fields(owner))
+            state.update(docs=docs, error="", next=now + 3600)
+            notify_findings(parcel, "recorder", [d["Instrument"] for d in docs])
+        except (ValueError, requests.RequestException) as exc:
+            state.update(error=str(exc), next=now + 900)
+    try:
+        reviews = load_lien_reviews()
+    except (OSError, ValueError):
+        reviews = {}
+        st.warning("Saved court checks are unavailable.")
+    rows = []
+    for parcel in parcels:
+        state = scans.get((parcel, owners[parcel]), {})
+        docs = state.get("docs")
+        status = ("Owner missing" if not owners[parcel] else "Queued") if docs is None else (
+            f"{len(docs)} possible matches" if docs else "No indexed match")
+        if state.get("error"):
+            status = "Check unavailable" + (f" · last result: {status}" if docs is not None else "")
+        review = get_lien_review(reviews, parcel)
+        judgment = review["checks"]["judgment"]
+        refs = review.get("court_references") or []
+        if judgment in ("Possible Match", "Record Found"):
+            notify_findings(parcel, "judgment", refs or ["See parcel review"])
+        state_lien = review["checks"]["state_tax_lien"]
+        if state_lien in ("Possible Match", "Record Found"):
+            notify_findings(parcel, "state tax lien", [state_lien])
+        rows.append({"Parcel": parcel, "Owner": owners[parcel], "Recorded liens / mortgages": status,
+                     "State tax lien review": state_lien, "Court judgment review": judgment, "Judgment references": ", ".join(refs)})
+    st.dataframe(rows, hide_index=True, width="stretch")
+    parcel = st.selectbox("Inspect a bid-list title check", parcels, index=None)
+    if parcel:
+        render_recorder_search(parcel, owners[parcel], "bid")
+
+
 def render_recorder_search(parcel, owner, location):
     key = f"recorder_{location}_{parcel}"
     st.markdown("#### Recorded liens and mortgages")
+    court_lookup(parcel, owner, key)
     last, first = owner_fields(owner)
     with st.form(key):
         left, right = st.columns(2)
@@ -1581,6 +1734,8 @@ def render_recorder_search(parcel, owner, location):
         st.link_button("Open the county recorder", ROD_SEARCH_URL, key=key + "_source")
         return
     if records:
+        notify_findings(parcel, "recorder", [r["Instrument"] for r in records])
+        st.warning(f"{len(records)} possible recorded lien or mortgage matches for this owner search.")
         st.dataframe(records, hide_index=True, width="stretch")
         st.caption(f"{len(records)} possible recording matches. These entries do not establish an outstanding balance or clear title.")
     else:
@@ -1703,7 +1858,7 @@ def render_lien_review_workspace(
             SC_COURTS_URL,
             use_container_width=True,
         )
-        st.caption("Select Spartanburg County; search judgments, foreclosures, lis pendens, owner name, or tax map.")
+        st.caption("Search Spartanburg County judgments, foreclosures, lis pendens, owner name, or tax map.")
 
     st.info(
         "This workspace is a preliminary screening tool. A saved green status means only that "
@@ -1831,6 +1986,9 @@ def county_comps(props, center, radius, days):
                and (b := numeric_value(p.get(field))) is not None):
             continue
         seen.add(parcel)
+        state_lien = review["checks"]["state_tax_lien"]
+        if state_lien in ("Possible Match", "Record Found"):
+            notify_findings(parcel, "state tax lien", [state_lien])
         rows.append({"Parcel": parcel, "Address": p.get("PropertyLocation"), "Price": p["SaleAmount"],
                      "Sq ft": size, "Date": format_arcgis_date(p["SaleDate"]), "Beds": p.get("BedRooms"),
                      "Full baths": p.get("FullBaths"), "Year built": p.get("YearBuilt"), "Acres": p.get("Acreage")})
@@ -2193,6 +2351,7 @@ def main() -> None:
         template = Path(__file__).with_name("bid_list.html").read_text(encoding="utf-8")
         st.iframe(template.replace("__BID_DATA__", json.dumps(data).replace("<", r"\u003c")), height=660,
                   alt="Bid list, notes and total spent")
+        bid_record_alerts(data["sale"], dict(zip(tax_df["Tax Map Number"].astype(str), tax_df["Owner Name"].fillna(""))))
     with history_tab:
         history = tax_history_workspace(tax_df)
     with map_tab:
