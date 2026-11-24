@@ -14,6 +14,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from urllib.parse import urljoin
+from lxml import html as recorder_html, etree
 from market_library import SPARTANBURG, fetch_listing, read_list
 
 import folium
@@ -1489,6 +1491,103 @@ def build_map(geojson: dict[str, Any], reviews=None) -> folium.Map:
     return map_object
 
 
+def owner_fields(owner):
+    name = " ".join(owner.replace(",", " ").split())
+    words = name.split()
+    if len(words) < 2 or set(words) & {"LLC", "INC", "CORP", "COMPANY", "TRUST", "ENTERPRISES", "LP"}:
+        return name, ""
+    return words[0], words[1]
+
+
+def search_documents(last, first):
+    with requests.Session() as session:
+        def post(page, fields):
+            response = session.post(urljoin(ROD_SEARCH_URL, page), data=fields, timeout=(5, 18))
+            response.raise_for_status()
+            try:
+                return recorder_html.fromstring(response.content)
+            except etree.ParserError as exc:
+                raise ValueError("The county returned an unreadable recording page.") from exc
+
+        portal = post("index.php", {"Accept": "Accept"})
+        if not portal.xpath('//form[@id="name_form"]'):
+            raise ValueError("The county name-search form is unavailable.")
+        fields = {"searchType": "name", "search_type": "Standard", "sort_type": "Date",
+                  "party_type": "Both", "entity_type": "Both", "last_name": last,
+                  "first_name": first, "show_pick_list": "on", "start_date": "", "end_date": "",
+                  "instType[LIENS][LIEN]": "LIEN", "instType[MORTGAGES][MORTGAGE]": "MORTGAGE"}
+        pick = post("content.php", fields)
+        forms = pick.xpath('//form[@id="pickListForm"][.//table[@id="plresults"]]')
+        if len(forms) != 1:
+            raise ValueError("The county did not return a recognizable name index.")
+        form = forms[0]
+        names = form.xpath('.//input[@name="name[]"]/@value')
+        if not names:
+            return []
+        if len(names) > 30:
+            raise ValueError("Too many name variants. Narrow the owner name and search again.")
+        fields = [(el.name, el.value or "") for el in form.xpath('.//input[@type="hidden"][@name]')]
+        fields.extend(("name[]", name) for name in names)
+        results = post("content.php", fields)
+        tables = results.xpath('//table[@id="results"]')
+        if len(tables) != 1:
+            raise ValueError("The county did not return the recording index.")
+        table = tables[0]
+        headings = [el.text_content().strip() for el in table.xpath("./thead/tr/th")]
+        expected = ["Date", "Book Info / FileNum", "Doc Type", "Legal Desc", "Search Party Type",
+                    "Searched Party", "Reverse Party", "XRef"]
+        if headings[:8] != expected:
+            raise ValueError("The county recording columns have changed.")
+        documents = []
+        for row in table.xpath("./tbody/tr"):
+            cells = row.xpath("./td")
+            if len(cells) < 8 or not row.get("id"):
+                raise ValueError("The county returned an incomplete recording row.")
+            values = [" ".join(cell.text_content().split()) for cell in cells[:8]]
+            dates = cells[0].xpath(".//a/text()")
+            documents.append({"Instrument": row.get("id"), "Document": values[2],
+                              "Recorded": " ".join(dates).strip() or values[0],
+                              "Book / page": values[1], "Indexed party": values[5],
+                              "Other party": values[6], "Legal description": values[3],
+                              "Cross-reference": values[7]})
+        return documents
+
+
+@st.cache_data(ttl=3600, max_entries=256, show_spinner=False)
+def recorder_matches(last, first):
+    return search_documents(last, first)
+
+
+def render_recorder_search(parcel, owner, location):
+    key = f"recorder_{location}_{parcel}"
+    st.markdown("#### Recorded liens and mortgages")
+    last, first = owner_fields(owner)
+    with st.form(key):
+        left, right = st.columns(2)
+        last = left.text_input("Last or company name", last).strip().upper()
+        first = right.text_input("First name", first).strip().upper()
+        submitted = st.form_submit_button("Search recorded liens and mortgages")
+    if not last:
+        st.info("Enter an owner name to search the county index.")
+        return
+    st.caption(f"County name-index search for {last} {first}. Compare the legal description and check for releases before relying on a match.")
+    try:
+        if submitted:
+            recorder_matches.clear(last, first)
+        with st.spinner("Searching Spartanburg County recorded documents…"):
+            records = recorder_matches(last, first)
+    except (requests.RequestException, ValueError) as exc:
+        st.warning(f"County search incomplete. {exc}")
+        st.link_button("Open the county recorder", ROD_SEARCH_URL, key=key + "_source")
+        return
+    if records:
+        st.dataframe(records, hide_index=True, width="stretch")
+        st.caption(f"{len(records)} possible recording matches. These entries do not establish an outstanding balance or clear title.")
+    else:
+        st.info("The county index returned no lien or mortgage entries for this name search.")
+    st.link_button("Verify recording with the county", ROD_SEARCH_URL, key=key + "_source")
+
+
 def render_lien_review_workspace(
     tax_map: str,
     merged_geojson: dict[str, Any],
@@ -1551,6 +1650,7 @@ def render_lien_review_workspace(
             st.caption("Assumes redemption in months 10–12. Earlier redemption uses a lower rate.")
 
 
+    render_recorder_search(tax_map, str(props.get("SaleOwnerName") or props.get("OwnerName") or ""), "map")
     st.markdown("#### Automatic parcel/title identifiers")
     id1, id2, id3 = st.columns(3)
     with id1:
@@ -1579,8 +1679,7 @@ def render_lien_review_workspace(
     st.caption("Saved workspace reviews are shared on this app instance. Hosting restarts or redeploys can erase local files.")
     st.markdown("#### Official research sources")
     st.caption(
-        "These buttons open the official public record systems. Phase 1 stores your findings; "
-        "the next development phase will automate sources that expose a reliable search endpoint."
+        "Use the state registry and court index separately for state tax liens and judgments."
     )
     src1, src2, src3 = st.columns(3)
     with src1:
@@ -1989,6 +2088,12 @@ def market_workspace(manual_name, tax_df, loaded_label):
         rows = tax_df[["Item Number", "Tax Map Number", "Owner Name", "Property Address", "Bid Amount"]]
         rows.attrs = {}
         st.dataframe(rows, hide_index=True, width="stretch", height=300)
+    owners = tax_df.set_index("Tax Map Number")["Owner Name"].fillna("").to_dict()
+    parcel = st.selectbox("Lien and mortgage search · choose a parcel", list(owners),
+                          index=None, key="market_recorder_parcel",
+                          format_func=lambda number: f"{number} · {owners[number]}")
+    if parcel:
+        render_recorder_search(parcel, owners[parcel], "market")
     def request_check():
         st.session_state.county_check_requested = True
 
