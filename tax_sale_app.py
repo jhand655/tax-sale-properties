@@ -2521,7 +2521,7 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
     ]
 
     with filter_panel:
-        search_text = st.text_input("Search properties", placeholder="Address, owner, item or parcel", key="filter_search")
+        search_text = st.text_input("Search properties", placeholder="Address, owner, item or parcel", key="filter_search", type="search")
         property_class_options = [
             "Residential",
             "Commercial",
