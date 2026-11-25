@@ -336,19 +336,8 @@ def render_hero() -> None:
     st.markdown(
         """
         <div class="investor-hero">
-          <div class="investor-eyebrow">Tax Sale Acquisition Dashboard</div>
-          <div class="investor-title">Spartanburg Tax Sale Deal Finder</div>
-          <div class="investor-subtitle">
-            Screen tax-sale opportunities like an investor: compare bids, review your Max Return Bid,
-            inspect parcel and assessor data, and narrow the map to properties that fit your acquisition criteria.
-          </div>
-          <div class="investor-pills">
-            <div class="investor-pill">Bid vs. Max Return</div>
-            <div class="investor-pill">Beds / Baths / Sq Ft</div>
-            <div class="investor-pill">Acreage & Year Built</div>
-            <div class="investor-pill">County Appraised Values</div>
-            <div class="investor-pill">Official Parcel Geometry</div>
-          </div>
+          <div class="investor-title">BidSift</div>
+          <div class="investor-subtitle">Sift the list. Find the deals.</div>
         </div>
         """,
         unsafe_allow_html=True,
