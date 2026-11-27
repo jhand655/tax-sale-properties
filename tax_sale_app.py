@@ -26,7 +26,7 @@ import streamlit as st
 from branca.element import MacroElement, Template
 from requests.adapters import HTTPAdapter
 from streamlit_folium import st_folium
-from urllib3.exceptions import HTTPError as TransportError
+from concurrent.futures import ThreadPoolExecutor
 from urllib3.util.retry import Retry
 
 APP_TITLE = "Spartanburg Tax Sale Deal Finder"
@@ -1960,7 +1960,6 @@ def comp_apn(value):
     return value if re.fullmatch(r"[0-9]{10}", value) else ""
 
 
-@st.cache_resource(ttl=86400, max_entries=1, show_spinner=False)
 def sold_catalog(as_of):
     columns = ["parcel_apn", "county_fips", "street", "unit", "city", "lat", "lng",
                "property_type", "sqft", "lot_sqft", "beds", "year_built", "last_sold_price", "last_sold_date"]
@@ -1980,6 +1979,8 @@ def sold_catalog(as_of):
     frame = frame.loc[frame["size"].gt(0) & frame.lat.between(34, 36) & frame.lng.between(-83, -81)]
     frame["last_sold_date"] = pd.to_datetime(frame.last_sold_date, errors="coerce")
     latest = frame.last_sold_date.where(frame.last_sold_date.le(pd.Timestamp(as_of))).max()
+    if frame.empty or pd.isna(latest):
+        raise ValueError("The sales feed contains no usable dated parcel records.")
     cutoff = pd.Timestamp(as_of) - pd.Timedelta(days=365)
     sales = frame.loc[frame.last_sold_date.between(cutoff, pd.Timestamp(as_of)) & frame.last_sold_price.ge(1000)
                       & (frame.property_type.eq("land") | frame.year_built.isna()
@@ -2020,6 +2021,71 @@ def sold_comparison(parcel, catalog):
     estimate = round(size * median(row["$ / sq ft"] for row in rows)) if len(rows) >= 3 else None
     basis = "lot area" if kind == "land" else "floor area"
     return estimate, rows, f"{kind.replace('_', ' ')} · {size:,.0f} sq ft {basis}"
+
+
+class SoldValuations:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.worker = ThreadPoolExecutor(max_workers=1)
+        self.job = None
+        self.catalog = None
+        self.results = {}
+        self.updated = None
+        self.refresh_at = 0
+        self.retry_at = 0
+        self.error = ""
+
+    def calculate(self, catalog, parcels):
+        if catalog is None:
+            catalog = sold_catalog(datetime.now(ZoneInfo("America/New_York")).date())
+        return catalog, {parcel: sold_comparison(parcel, catalog) for parcel in parcels}
+
+    def snapshot(self, parcels, retry=False):
+        with self.lock:
+            now = monotonic()
+            if self.job is not None and self.job.done():
+                try:
+                    catalog, results = self.job.result()
+                    if catalog is not self.catalog:
+                        self.results = {}
+                        self.updated = datetime.now(ZoneInfo("America/New_York"))
+                        self.refresh_at = now + 86400
+                    self.catalog = catalog
+                    self.results.update(results)
+                    self.error = ""
+                    self.retry_at = 0
+                except Exception as exc:
+                    self.error = str(exc) or type(exc).__name__
+                    self.retry_at = now + 900
+                self.job = None
+            refresh = now >= self.refresh_at
+            missing = parcels if refresh else parcels.difference(self.results)
+            if missing and self.job is None and (retry or now >= self.retry_at):
+                self.job = self.worker.submit(self.calculate, None if refresh else self.catalog, missing)
+            values = {p: self.results[p] for p in parcels if p in self.results}
+            return values, self.catalog[2] if self.catalog is not None else None, self.updated, self.error, self.job is not None
+
+
+@st.cache_resource
+def shared_valuations():
+    return SoldValuations()
+
+
+@st.fragment(run_every="5s")
+def valuation_status(parcels, displayed):
+    service = shared_valuations()
+    values, _, updated, error, busy = service.snapshot(parcels)
+    if (len(values), updated) != displayed:
+        st.rerun()
+    if updated:
+        st.caption(f"Closed-sale data last loaded {updated:%b %d, %Y at %I:%M %p %Z}.")
+    if busy:
+        st.caption("Updating closed-sale estimates in the background…")
+    elif error:
+        st.warning(f"Closed-sale update unavailable. Retrying in 15 minutes. {error}")
+        if st.button("Retry closed-sale update"):
+            service.snapshot(parcels, retry=True)
+            st.rerun()
 
 
 def county_comps(props, center, radius, days):
@@ -2479,18 +2545,18 @@ def render_property_map(tax_df, uploaded, refresh, filter_panel, count_slot, his
 
     sold_details = {}
     latest_sale = None
-    if any(comp_apn(f["properties"]["TaxMapNumber"]) for f in merged_geojson["features"]):
-        try:
-            catalog = sold_catalog(datetime.now(ZoneInfo("America/New_York")).date())
-            latest_sale = catalog[2]
-            for feature in merged_geojson["features"]:
-                props = feature["properties"]
-                parcel = props["TaxMapNumber"]
-                estimate, evidence, basis = sold_comparison(parcel, catalog)
-                sold_details[parcel] = estimate, evidence, basis
-                props.update({"SoldCompEstimate": estimate, "SoldCompCount": len(evidence)})
-        except (requests.RequestException, TransportError, OSError, ValueError) as exc:
-            st.warning(f"Closed-sale data unavailable. {exc}")
+    parcels = frozenset(apn for f in merged_geojson["features"]
+                       if (apn := comp_apn(f["properties"]["TaxMapNumber"])))
+    if parcels:
+        values, latest_sale, updated, _, _ = shared_valuations().snapshot(parcels)
+        valuation_status(parcels, (len(values), updated))
+        for feature in merged_geojson["features"]:
+            props = feature["properties"]
+            parcel = props["TaxMapNumber"]
+            result = values.get(comp_apn(parcel))
+            if result is not None:
+                sold_details[parcel] = result
+                props.update({"SoldCompEstimate": result[0], "SoldCompCount": len(result[1])})
     for feature in merged_geojson["features"]:
         props = feature["properties"]
         props.update(history.get(props["TaxMapNumber"], {}))
