@@ -2315,8 +2315,9 @@ def market_check(state, manual):
     if manual or previous is None or monotonic() >= previous["due"]:
         with st.spinner("Checking the county page and reading the latest sale lists…", show_time=True):
             candidate, error, checked = county_candidate()
+        interval = 15 * 60 if error is not None else 24 * 60 * 60
         previous = {"candidate": candidate, "error": error, "checked": checked,
-                    "due": monotonic() + 900, "mode": "Manual" if manual else "Automatic"}
+                    "due": monotonic() + interval, "mode": "Manual" if manual else "Automatic"}
         state["county_check"] = previous
     return previous
 
@@ -2386,7 +2387,7 @@ def county_pdf_fallback(candidate):
 @st.fragment(run_every="1m")
 def market_workspace(manual_name, tax_df, loaded_label):
     st.subheader("My Markets")
-    st.caption("Checks the county every 15 minutes while the app is open. Your selected list is saved in this browser.")
+    st.caption("Checks the county on opening a session and every 24 hours after a successful check. Failed checks retry after 15 minutes while the app is open. Your selected list is saved in this browser.")
     st.markdown(f"**Loaded sale list** · {loaded_label} · {len(tax_df):,} listings")
     with st.expander("View loaded listings"):
         rows = tax_df[["Item Number", "Tax Map Number", "Owner Name", "Property Address", "Bid Amount"]]
